@@ -1,0 +1,81 @@
+name: report
+
+# ⚠️ Triggers/auto-writes: read playbook/automation-map.md before changing 'on:' or adding a commit-back.
+#    This pushes to admin with GITHUB_TOKEN (can't re-trigger). Don't add a 'push' trigger here without
+#    accounting for register/request's ORG_PAT writes to this repo (they WOULD fire it).
+# Manual refresh only. Instructor: Actions → report → "Run workflow" (no inputs).
+# PRIVATE admin repo → only org members (instructor) can see/trigger.
+# Builds REPORT.md (index: a separate table PER COURSE, rows sorted by assignment) +
+# one detail file per course/assignment under reports/. Clicking "open" just views a pre-built file.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write   # commit report files
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build split reports (per-course index + per course/assignment detail)
+        env:
+          ORG: ${{ github.repository_owner }}
+        run: |
+          set -euo pipefail
+          STAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          rm -rf reports
+          mkdir -p reports
+          HAVE="$(find log -name '*.json' 2>/dev/null | wc -l | tr -d ' ')"
+          TAB="$(printf '\t')"
+
+          # --- index REPORT.md: one table per course, rows sorted by assignment ---
+          {
+            echo "# Submission Report — Index"
+            echo ""
+            echo "_Generated ${STAMP} UTC — refresh: Actions → report → Run workflow. Total repos: **${HAVE}**._"
+            if [ "$HAVE" -gt 0 ]; then
+              jq -r '.course' log/*.json | sort -u | while read -r course; do
+                [ -n "$course" ] || continue
+                echo ""
+                echo "## ${course}"
+                echo ""
+                echo "| Assignment | Submitted | Detail |"
+                echo "|---|---|---|"
+                jq -r --arg c "$course" 'select(.course==$c) | .assignment' log/*.json | sort -u | while read -r assign; do
+                  [ -n "$assign" ] || continue
+                  n="$(jq -r --arg c "$course" --arg a "$assign" 'select(.course==$c and .assignment==$a) | .username' log/*.json | wc -l | tr -d ' ')"
+                  echo "| ${assign} | ${n} | [open](reports/${course}-${assign}.md) |"
+                done
+              done
+            fi
+          } > REPORT.md
+
+          # --- per course/assignment detail files (student list) ---
+          if [ "$HAVE" -gt 0 ]; then
+            jq -r '"\(.course)\t\(.assignment)"' log/*.json | sort -u | while IFS="$TAB" read -r course assign; do
+              [ -n "$course" ] || continue
+              {
+                echo "# ${course} / ${assign}"
+                echo ""
+                echo "_Generated ${STAMP} UTC_ · [← index](../REPORT.md)"
+                echo ""
+                echo "| Username | Name | Email | Repo |"
+                echo "|---|---|---|---|"
+                jq -r --arg o "$ORG" --arg c "$course" --arg a "$assign" '
+                  select(.course==$c and .assignment==$a)
+                  | "| \(.username) | \(.name) | \(.email) | [\(.repo)](https://github.com/\($o)/\(.repo)) |"' log/*.json | sort
+              } > "reports/${course}-${assign}.md"
+            done
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "reports unchanged"
+          else
+            git commit -m "report: refresh ${STAMP}"
+            git push
+          fi
