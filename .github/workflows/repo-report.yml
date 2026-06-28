@@ -1,17 +1,23 @@
 name: repo-report
 
 # Manual, PER-COURSE refresh. Instructor: Actions -> repo-report -> Run workflow -> enter `course`
-# (e.g. cs120). Rebuilds ONLY that course's per-assignment detail files (with autograder
-# pass/fail + score) + the index repo-report.md. PRIVATE admin repo.
+# (e.g. cs120; case-insensitive). Rebuilds ONLY that course's per-assignment detail files (with
+# autograder pass/fail + score) + the index repo-report.md + README.md. PRIVATE admin repo.
 # Reading OTHER repos' Actions needs ORG_REPO_TOKEN (a PAT with org actions:read) — the default
 # GITHUB_TOKEN is scoped to THIS repo only and cannot read student repos' runs.
 on:
   workflow_dispatch:
     inputs:
       course:
-        description: "Course to rebuild (e.g. cs120). Blank = ALL courses (slow: downloads every repo's log)."
+        description: "Course to rebuild (e.g. cs120; case-insensitive). Blank = ALL courses (slow)."
         required: false
         default: ""
+
+# Serialize ALL admin report commits (repo-report + roster share this group) so two runs never
+# push to the same branch at once (a concurrent push is rejected non-fast-forward).
+concurrency:
+  group: classroom-admin-report
+  cancel-in-progress: false
 
 permissions:
   contents: write   # commit report files (uses checkout's default token)
@@ -33,22 +39,25 @@ jobs:
           mkdir -p reports
           HAVE="$(find log -name '*.json' 2>/dev/null | wc -l | tr -d ' ')"
           TAB="$(printf '\t')"
+          # course matching is CASE-INSENSITIVE: normalize the input + every course to lowercase
+          # (so `COMSC240` and `comsc240` are one course).
+          ONLY="$(printf '%s' "${ONLY:-}" | tr '[:upper:]' '[:lower:]')"
 
           # validate the course input: a typo must FAIL loudly, not silently produce nothing
-          if [ -n "${ONLY}" ] && ! jq -r '.course' log/*.json 2>/dev/null | sort -u | grep -qx "${ONLY}"; then
-            echo "::error::course '${ONLY}' not found. Valid: $(jq -r '.course' log/*.json 2>/dev/null | sort -u | paste -sd' ' -)"
+          if [ -n "${ONLY}" ] && [ "$HAVE" -gt 0 ] && ! jq -r '.course|ascii_downcase' log/*.json 2>/dev/null | sort -u | grep -qx "${ONLY}"; then
+            echo "::error::course '${ONLY}' not found. Valid: $(jq -r '.course|ascii_downcase' log/*.json 2>/dev/null | sort -u | paste -sd' ' -)"
             exit 1
           fi
 
           # ---- build the per-course index BODY once (counts + open links), reused below ----
           : > /tmp/idx_body.md
           if [ "$HAVE" -gt 0 ]; then
-            jq -r '.course' log/*.json | sort -u | while read -r course; do
+            jq -r '.course|ascii_downcase' log/*.json | sort -u | while read -r course; do
               [ -n "$course" ] || continue
               { echo ""; echo "## ${course}"; echo ""; echo "| Assignment | Submitted | Detail |"; echo "|---|---|---|"; } >> /tmp/idx_body.md
-              jq -r --arg c "$course" 'select(.course==$c) | .assignment' log/*.json | sort -u | while read -r assign; do
+              jq -r --arg c "$course" 'select((.course|ascii_downcase)==$c) | .assignment' log/*.json | sort -u | while read -r assign; do
                 [ -n "$assign" ] || continue
-                n="$(jq -r --arg c "$course" --arg a "$assign" 'select(.course==$c and .assignment==$a) | .username' log/*.json | wc -l | tr -d ' ')"
+                n="$(jq -r --arg c "$course" --arg a "$assign" 'select((.course|ascii_downcase)==$c and .assignment==$a) | .username' log/*.json | wc -l | tr -d ' ')"
                 echo "| ${assign} | ${n} | [open](reports/${course}-${assign}.md) |" >> /tmp/idx_body.md
               done
             done
@@ -75,7 +84,7 @@ jobs:
             echo "- \`reports/\` — generated detail pages · \`log/\`, \`roster/\` — raw PII data (do not share)."
             echo ""
             echo "## Refresh (manual, per course)"
-            echo "- **Actions → \`repo-report\` → Run workflow → enter a course** (e.g. \`cs120\`) — rebuilds THAT course's pass/fail + score."
+            echo "- **Actions → \`repo-report\` → Run workflow → enter a course** (e.g. \`cs120\`; case-insensitive) — rebuilds THAT course's pass/fail + score."
             echo "- **Actions → \`roster\` → Run workflow → enter a course** — rebuilds that course's roster."
             echo "- Per-course on purpose: only the course you run is rebuilt (no all-course overhead)."
             echo ""
@@ -104,8 +113,8 @@ jobs:
             esac
             if [ -n "$runid" ]; then
               if gh api "/repos/${ORG}/${repo}/actions/runs/${runid}/logs" > /tmp/rl.zip 2>/dev/null && [ -s /tmp/rl.zip ]; then
-                tp="$(unzip -p /tmp/rl.zip 2>/dev/null | grep -o '"totalPoints":[0-9]*' | tail -1 | grep -o '[0-9]*' || true)"
-                mp="$(unzip -p /tmp/rl.zip 2>/dev/null | grep -o '"maxPoints":[0-9]*'   | tail -1 | grep -o '[0-9]*' || true)"
+                tp="$(unzip -p /tmp/rl.zip 2>/dev/null | grep -oE '"totalPoints": *[0-9]+' | tail -1 | grep -oE '[0-9]+' || true)"
+                mp="$(unzip -p /tmp/rl.zip 2>/dev/null | grep -oE '"maxPoints": *[0-9]+'   | tail -1 | grep -oE '[0-9]+' || true)"
                 [ -n "$tp" ] && [ -n "$mp" ] && score="${tp}/${mp}"
               fi
               rm -f /tmp/rl.zip
@@ -115,7 +124,7 @@ jobs:
 
           # ---- per course/assignment detail — ONLY the chosen course (blank = all) ----
           if [ "$HAVE" -gt 0 ]; then
-            jq -r '"\(.course)\t\(.assignment)"' log/*.json | sort -u | while IFS="$TAB" read -r course assign; do
+            jq -r '"\(.course|ascii_downcase)\t\(.assignment)"' log/*.json | sort -u | while IFS="$TAB" read -r course assign; do
               [ -n "$course" ] || continue
               if [ -n "${ONLY}" ] && [ "${ONLY}" != "${course}" ]; then continue; fi
               echo "building ${course}/${assign} ..."
@@ -127,7 +136,7 @@ jobs:
                 echo "| Username | Name | Result | Score | Repo |"
                 echo "|---|---|---|---|---|"
                 jq -r --arg c "$course" --arg a "$assign" '
-                  select(.course==$c and .assignment==$a) | "\(.username)\t\(.name)\t\(.repo)"' log/*.json \
+                  select((.course|ascii_downcase)==$c and .assignment==$a) | "\(.username)\t\(.name)\t\(.repo)"' log/*.json \
                   | awk -F"$TAB" '{n=split($2,a," "); print tolower(a[n]) "\t" $0}' | sort -f | cut -f2- | \
                 while IFS="$TAB" read -r username name repo; do
                   [ -n "$repo" ] || continue
@@ -146,5 +155,12 @@ jobs:
             echo "reports unchanged"
           else
             git commit -m "repo-report: refresh ${STAMP} (course=${ONLY:-all})"
-            git push
+            # push with retry: if the remote advanced between checkout and push, rebase + retry
+            n=0
+            until git push 2>/dev/null; do
+              n=$((n+1)); [ "$n" -gt 4 ] && { echo "::error::git push failed after $n retries"; exit 1; }
+              echo "push rejected — syncing remote then retrying ($n)..."
+              git pull --rebase --autostash --no-edit 2>/dev/null || true
+              sleep $((n*2))
+            done
           fi

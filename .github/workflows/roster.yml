@@ -1,6 +1,6 @@
 name: roster
 
-# Manual roster build. Instructor: Actions -> roster -> Run workflow (optional `course` filter).
+# Manual roster build. Instructor: Actions -> roster -> Run workflow (optional `course`, case-insensitive).
 # Builds per-course student rosters from log/*.json (the org-hub provisioning records). Each
 # student NAME links to a per-student page listing all that student's repos for the course.
 # log-based ONLY — NO Actions/autograder calls (pass/fail lives in repo-report). Cheap & fast.
@@ -8,9 +8,14 @@ on:
   workflow_dispatch:
     inputs:
       course:
-        description: "Course to rebuild (e.g. cs120). Blank = ALL courses."
+        description: "Course to rebuild (e.g. cs120; case-insensitive). Blank = ALL courses."
         required: false
         default: ""
+
+# Share one serialization group with repo-report so admin report commits never push concurrently.
+concurrency:
+  group: classroom-admin-report
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -32,10 +37,12 @@ jobs:
           HAVE="$(find log -name '*.json' 2>/dev/null | wc -l | tr -d ' ')"
           TAB="$(printf '\t')"
           [ "$HAVE" -gt 0 ] || { echo "no log/*.json"; exit 0; }
+          # course matching is CASE-INSENSITIVE: normalize input + every course to lowercase.
+          ONLY="$(printf '%s' "${ONLY:-}" | tr '[:upper:]' '[:lower:]')"
 
           # validate the course input: a typo must FAIL loudly, not silently produce nothing
-          if [ -n "${ONLY}" ] && ! jq -r '.course' log/*.json 2>/dev/null | sort -u | grep -qx "${ONLY}"; then
-            echo "::error::course '${ONLY}' not found. Valid: $(jq -r '.course' log/*.json 2>/dev/null | sort -u | paste -sd' ' -)"
+          if [ -n "${ONLY}" ] && ! jq -r '.course|ascii_downcase' log/*.json 2>/dev/null | sort -u | grep -qx "${ONLY}"; then
+            echo "::error::course '${ONLY}' not found. Valid: $(jq -r '.course|ascii_downcase' log/*.json 2>/dev/null | sort -u | paste -sd' ' -)"
             exit 1
           fi
 
@@ -44,16 +51,16 @@ jobs:
             echo "# Roster — Index"
             echo ""
             echo "_Generated ${STAMP} UTC — refresh: Actions -> roster -> Run workflow._"
-            jq -r '.course' log/*.json | sort -u | while read -r course; do
+            jq -r '.course|ascii_downcase' log/*.json | sort -u | while read -r course; do
               [ -n "$course" ] || continue
-              n="$(jq -r --arg c "$course" 'select(.course==$c)|.username' log/*.json | sort -u | wc -l | tr -d ' ')"
+              n="$(jq -r --arg c "$course" 'select((.course|ascii_downcase)==$c)|.username' log/*.json | sort -u | wc -l | tr -d ' ')"
               echo ""
               echo "## ${course} — ${n} students · [roster](reports/${course}-roster.md)"
             done
           } > roster.md
 
           # ---- per-course roster + per-student repo list (chosen course, blank = all) ----
-          jq -r '.course' log/*.json | sort -u | while read -r course; do
+          jq -r '.course|ascii_downcase' log/*.json | sort -u | while read -r course; do
             [ -n "$course" ] || continue
             if [ -n "${ONLY}" ] && [ "${ONLY}" != "${course}" ]; then continue; fi
             echo "building roster ${course} ..."
@@ -65,9 +72,9 @@ jobs:
               echo ""
               echo "| Name | Username | Email | Repos |"
               echo "|---|---|---|---|"
-              # ONE row per username (a user's log entries can carry varying name/email — dedup by username)
-              # username-dedup, then sort by LAST NAME (name's last token) ascending — matches Canvas order
-              jq -r --arg c "$course" 'select(.course==$c)|"\(.username)\t\(.name)\t\(.email)"' log/*.json | sort -f | awk -F"$TAB" '!seen[$1]++' \
+              # ONE row per username (a user's log entries can carry varying name/email — dedup by username),
+              # then sort by LAST NAME (name's last token) ascending — matches Canvas order.
+              jq -r --arg c "$course" 'select((.course|ascii_downcase)==$c)|"\(.username)\t\(.name)\t\(.email)"' log/*.json | sort -f | awk -F"$TAB" '!seen[$1]++' \
                 | awk -F"$TAB" '{n=split($2,a," "); print tolower(a[n]) "\t" $0}' | sort -f | cut -f2- | \
               while IFS="$TAB" read -r username name email; do
                 [ -n "$username" ] || continue
@@ -75,7 +82,7 @@ jobs:
               done
             } > "reports/${course}-roster.md"
             # per-student page: all repos this student has in the course
-            jq -r --arg c "$course" 'select(.course==$c)|.username' log/*.json | sort -u | while read -r username; do
+            jq -r --arg c "$course" 'select((.course|ascii_downcase)==$c)|.username' log/*.json | sort -u | while read -r username; do
               [ -n "$username" ] || continue
               {
                 echo "# ${course} / ${username} — repos"
@@ -84,7 +91,7 @@ jobs:
                 echo ""
                 echo "| Assignment | Repo |"
                 echo "|---|---|"
-                jq -r --arg c "$course" --arg u "$username" 'select(.course==$c and .username==$u)|"\(.assignment)\t\(.repo)"' log/*.json | sort | \
+                jq -r --arg c "$course" --arg u "$username" 'select((.course|ascii_downcase)==$c and .username==$u)|"\(.assignment)\t\(.repo)"' log/*.json | sort | \
                 while IFS="$TAB" read -r assign repo; do
                   [ -n "$repo" ] || continue
                   echo "| ${assign} | [${repo}](https://github.com/${ORG}/${repo}) |"
@@ -100,5 +107,12 @@ jobs:
             echo "roster unchanged"
           else
             git commit -m "roster: refresh ${STAMP} (course=${ONLY:-all})"
-            git push
+            # push with retry: if the remote advanced between checkout and push, rebase + retry
+            n=0
+            until git push 2>/dev/null; do
+              n=$((n+1)); [ "$n" -gt 4 ] && { echo "::error::git push failed after $n retries"; exit 1; }
+              echo "push rejected — syncing remote then retrying ($n)..."
+              git pull --rebase --autostash --no-edit 2>/dev/null || true
+              sleep $((n*2))
+            done
           fi
