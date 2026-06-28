@@ -1,0 +1,150 @@
+name: repo-report
+
+# Manual, PER-COURSE refresh. Instructor: Actions -> repo-report -> Run workflow -> enter `course`
+# (e.g. cs120). Rebuilds ONLY that course's per-assignment detail files (with autograder
+# pass/fail + score) + the index repo-report.md. PRIVATE admin repo.
+# Reading OTHER repos' Actions needs ORG_REPO_TOKEN (a PAT with org actions:read) — the default
+# GITHUB_TOKEN is scoped to THIS repo only and cannot read student repos' runs.
+on:
+  workflow_dispatch:
+    inputs:
+      course:
+        description: "Course to rebuild (e.g. cs120). Blank = ALL courses (slow: downloads every repo's log)."
+        required: false
+        default: ""
+
+permissions:
+  contents: write   # commit report files (uses checkout's default token)
+
+jobs:
+  repo-report:
+    runs-on: ubuntu-latest
+    env:
+      ORG: ${{ github.repository_owner }}
+      GH_TOKEN: ${{ secrets.ORG_REPO_TOKEN }}   # cross-repo actions:read for `gh api`
+      ONLY: ${{ inputs.course }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build repo-report (index + per course/assignment detail with pass/fail + score)
+        run: |
+          set -uo pipefail
+          STAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          mkdir -p reports
+          HAVE="$(find log -name '*.json' 2>/dev/null | wc -l | tr -d ' ')"
+          TAB="$(printf '\t')"
+
+          # validate the course input: a typo must FAIL loudly, not silently produce nothing
+          if [ -n "${ONLY}" ] && ! jq -r '.course' log/*.json 2>/dev/null | sort -u | grep -qx "${ONLY}"; then
+            echo "::error::course '${ONLY}' not found. Valid: $(jq -r '.course' log/*.json 2>/dev/null | sort -u | paste -sd' ' -)"
+            exit 1
+          fi
+
+          # ---- build the per-course index BODY once (counts + open links), reused below ----
+          : > /tmp/idx_body.md
+          if [ "$HAVE" -gt 0 ]; then
+            jq -r '.course' log/*.json | sort -u | while read -r course; do
+              [ -n "$course" ] || continue
+              { echo ""; echo "## ${course}"; echo ""; echo "| Assignment | Submitted | Detail |"; echo "|---|---|---|"; } >> /tmp/idx_body.md
+              jq -r --arg c "$course" 'select(.course==$c) | .assignment' log/*.json | sort -u | while read -r assign; do
+                [ -n "$assign" ] || continue
+                n="$(jq -r --arg c "$course" --arg a "$assign" 'select(.course==$c and .assignment==$a) | .username' log/*.json | wc -l | tr -d ' ')"
+                echo "| ${assign} | ${n} | [open](reports/${course}-${assign}.md) |" >> /tmp/idx_body.md
+              done
+            done
+          fi
+
+          # ---- repo-report.md = plain index (header + body) ----
+          {
+            echo "# Submission Report — Index"
+            echo ""
+            echo "_Generated ${STAMP} UTC — refresh: Actions -> repo-report -> Run workflow (enter a course). Total repos: **${HAVE}**._"
+            cat /tmp/idx_body.md
+          } > repo-report.md
+
+          # ---- README.md = manual/guide + the SAME index (so the repo landing page shows status) ----
+          # (GENERATED every run — edit the guide text in this workflow, not README directly.)
+          {
+            echo "# ${ORG} — Classroom Hub (admin · PRIVATE)"
+            echo ""
+            echo "> ⛔ **PRIVATE — never make this repo public.** It stores PII: \`roster/<username>.json\` (student name / email / registered) and \`log/<repo>.json\` (per-repo provisioning records). Written by the \`${ORG}/classroom\` workflows via \`ORG_PAT\`."
+            echo ""
+            echo "## What's here"
+            echo "- **This page** = live submission status per course (autograder **pass/fail + score**). Click **open** for a per-assignment detail."
+            echo "- [\`roster.md\`](roster.md) — student roster per course; each name links to that student's repo list."
+            echo "- \`reports/\` — generated detail pages · \`log/\`, \`roster/\` — raw PII data (do not share)."
+            echo ""
+            echo "## Refresh (manual, per course)"
+            echo "- **Actions → \`repo-report\` → Run workflow → enter a course** (e.g. \`cs120\`) — rebuilds THAT course's pass/fail + score."
+            echo "- **Actions → \`roster\` → Run workflow → enter a course** — rebuilds that course's roster."
+            echo "- Per-course on purpose: only the course you run is rebuilt (no all-course overhead)."
+            echo ""
+            echo "## How to read the status"
+            echo "- **Result**: ✅ pass / ❌ fail = the latest push run's autograder conclusion."
+            echo "- **Score**: autograder \`totalPoints/maxPoints\` parsed from the run log."
+            echo ""
+            echo "_Status generated ${STAMP} UTC · total repos: **${HAVE}**._"
+            echo ""
+            echo "---"
+            echo "# Submission status"
+            cat /tmp/idx_body.md
+          } > README.md
+
+          # ---- autograder result for one repo -> prints "PF<TAB>SCORE" ----
+          autograder_result () {
+            repo="$1"; runs=""; runid=""; concl=""; pf=""; score="—"; tp=""; mp=""
+            runs="$(gh api "/repos/${ORG}/${repo}/actions/runs?event=push&per_page=1" 2>/dev/null || echo '{}')"
+            concl="$(printf '%s' "$runs" | jq -r '.workflow_runs[0].conclusion // "none"')"
+            runid="$(printf '%s' "$runs" | jq -r '.workflow_runs[0].id // empty')"
+            case "$concl" in
+              success) pf="✅ pass";;
+              failure) pf="❌ fail";;
+              none)    pf="— no run";;
+              *)       pf="… ${concl}";;
+            esac
+            if [ -n "$runid" ]; then
+              if gh api "/repos/${ORG}/${repo}/actions/runs/${runid}/logs" > /tmp/rl.zip 2>/dev/null && [ -s /tmp/rl.zip ]; then
+                tp="$(unzip -p /tmp/rl.zip 2>/dev/null | grep -o '"totalPoints":[0-9]*' | tail -1 | grep -o '[0-9]*' || true)"
+                mp="$(unzip -p /tmp/rl.zip 2>/dev/null | grep -o '"maxPoints":[0-9]*'   | tail -1 | grep -o '[0-9]*' || true)"
+                [ -n "$tp" ] && [ -n "$mp" ] && score="${tp}/${mp}"
+              fi
+              rm -f /tmp/rl.zip
+            fi
+            printf '%s\t%s' "$pf" "$score"
+          }
+
+          # ---- per course/assignment detail — ONLY the chosen course (blank = all) ----
+          if [ "$HAVE" -gt 0 ]; then
+            jq -r '"\(.course)\t\(.assignment)"' log/*.json | sort -u | while IFS="$TAB" read -r course assign; do
+              [ -n "$course" ] || continue
+              if [ -n "${ONLY}" ] && [ "${ONLY}" != "${course}" ]; then continue; fi
+              echo "building ${course}/${assign} ..."
+              {
+                echo "# ${course} / ${assign}"
+                echo ""
+                echo "_Generated ${STAMP} UTC_ · [← index](../repo-report.md)"
+                echo ""
+                echo "| Username | Name | Result | Score | Repo |"
+                echo "|---|---|---|---|---|"
+                jq -r --arg c "$course" --arg a "$assign" '
+                  select(.course==$c and .assignment==$a) | "\(.username)\t\(.name)\t\(.repo)"' log/*.json \
+                  | awk -F"$TAB" '{n=split($2,a," "); print tolower(a[n]) "\t" $0}' | sort -f | cut -f2- | \
+                while IFS="$TAB" read -r username name repo; do
+                  [ -n "$repo" ] || continue
+                  res="$(autograder_result "$repo")"
+                  pf="${res%%${TAB}*}"; score="${res##*${TAB}}"
+                  echo "| ${username} | ${name} | ${pf} | ${score} | [${repo}](https://github.com/${ORG}/${repo}) |"
+                done
+              } > "reports/${course}-${assign}.md"
+            done
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "reports unchanged"
+          else
+            git commit -m "repo-report: refresh ${STAMP} (course=${ONLY:-all})"
+            git push
+          fi

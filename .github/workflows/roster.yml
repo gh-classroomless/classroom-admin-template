@@ -1,0 +1,104 @@
+name: roster
+
+# Manual roster build. Instructor: Actions -> roster -> Run workflow (optional `course` filter).
+# Builds per-course student rosters from log/*.json (the org-hub provisioning records). Each
+# student NAME links to a per-student page listing all that student's repos for the course.
+# log-based ONLY — NO Actions/autograder calls (pass/fail lives in repo-report). Cheap & fast.
+on:
+  workflow_dispatch:
+    inputs:
+      course:
+        description: "Course to rebuild (e.g. cs120). Blank = ALL courses."
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  roster:
+    runs-on: ubuntu-latest
+    env:
+      ORG: ${{ github.repository_owner }}
+      ONLY: ${{ inputs.course }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build roster index + per-course roster + per-student repo list
+        run: |
+          set -uo pipefail
+          STAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          mkdir -p reports
+          HAVE="$(find log -name '*.json' 2>/dev/null | wc -l | tr -d ' ')"
+          TAB="$(printf '\t')"
+          [ "$HAVE" -gt 0 ] || { echo "no log/*.json"; exit 0; }
+
+          # validate the course input: a typo must FAIL loudly, not silently produce nothing
+          if [ -n "${ONLY}" ] && ! jq -r '.course' log/*.json 2>/dev/null | sort -u | grep -qx "${ONLY}"; then
+            echo "::error::course '${ONLY}' not found. Valid: $(jq -r '.course' log/*.json 2>/dev/null | sort -u | paste -sd' ' -)"
+            exit 1
+          fi
+
+          # ---- index roster.md: per course, student count + link ----
+          {
+            echo "# Roster — Index"
+            echo ""
+            echo "_Generated ${STAMP} UTC — refresh: Actions -> roster -> Run workflow._"
+            jq -r '.course' log/*.json | sort -u | while read -r course; do
+              [ -n "$course" ] || continue
+              n="$(jq -r --arg c "$course" 'select(.course==$c)|.username' log/*.json | sort -u | wc -l | tr -d ' ')"
+              echo ""
+              echo "## ${course} — ${n} students · [roster](reports/${course}-roster.md)"
+            done
+          } > roster.md
+
+          # ---- per-course roster + per-student repo list (chosen course, blank = all) ----
+          jq -r '.course' log/*.json | sort -u | while read -r course; do
+            [ -n "$course" ] || continue
+            if [ -n "${ONLY}" ] && [ "${ONLY}" != "${course}" ]; then continue; fi
+            echo "building roster ${course} ..."
+            # roster table: one row per distinct student; Name links to per-student repo page
+            {
+              echo "# ${course} — Roster"
+              echo ""
+              echo "_Generated ${STAMP} UTC_ · [← index](../roster.md)"
+              echo ""
+              echo "| Name | Username | Email | Repos |"
+              echo "|---|---|---|---|"
+              # ONE row per username (a user's log entries can carry varying name/email — dedup by username)
+              # username-dedup, then sort by LAST NAME (name's last token) ascending — matches Canvas order
+              jq -r --arg c "$course" 'select(.course==$c)|"\(.username)\t\(.name)\t\(.email)"' log/*.json | sort -f | awk -F"$TAB" '!seen[$1]++' \
+                | awk -F"$TAB" '{n=split($2,a," "); print tolower(a[n]) "\t" $0}' | sort -f | cut -f2- | \
+              while IFS="$TAB" read -r username name email; do
+                [ -n "$username" ] || continue
+                echo "| [${name}](${course}-student-${username}.md) | ${username} | ${email} | [repos](${course}-student-${username}.md) |"
+              done
+            } > "reports/${course}-roster.md"
+            # per-student page: all repos this student has in the course
+            jq -r --arg c "$course" 'select(.course==$c)|.username' log/*.json | sort -u | while read -r username; do
+              [ -n "$username" ] || continue
+              {
+                echo "# ${course} / ${username} — repos"
+                echo ""
+                echo "_Generated ${STAMP} UTC_ · [← roster](${course}-roster.md)"
+                echo ""
+                echo "| Assignment | Repo |"
+                echo "|---|---|"
+                jq -r --arg c "$course" --arg u "$username" 'select(.course==$c and .username==$u)|"\(.assignment)\t\(.repo)"' log/*.json | sort | \
+                while IFS="$TAB" read -r assign repo; do
+                  [ -n "$repo" ] || continue
+                  echo "| ${assign} | [${repo}](https://github.com/${ORG}/${repo}) |"
+                done
+              } > "reports/${course}-student-${username}.md"
+            done
+          done
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "roster unchanged"
+          else
+            git commit -m "roster: refresh ${STAMP} (course=${ONLY:-all})"
+            git push
+          fi
