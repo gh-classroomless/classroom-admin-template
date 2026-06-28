@@ -12,6 +12,10 @@ on:
         description: "Course to rebuild (e.g. cs120; case-insensitive). Blank = ALL courses (slow)."
         required: false
         default: ""
+      semester:
+        description: "Term to view (e.g. sp26). Blank = CURRENT term. A past term reads log/archive/<term>/ and writes separate files (does not touch the live README/index)."
+        required: false
+        default: ""
 
 # Serialize ALL admin report commits (repo-report + roster share this group) so two runs never
 # push to the same branch at once (a concurrent push is rejected non-fast-forward).
@@ -29,6 +33,7 @@ jobs:
       ORG: ${{ github.repository_owner }}
       GH_TOKEN: ${{ secrets.ORG_REPO_TOKEN }}   # cross-repo actions:read for `gh api`
       ONLY: ${{ inputs.course }}
+      SEM: ${{ inputs.semester }}
     steps:
       - uses: actions/checkout@v4
 
@@ -37,28 +42,35 @@ jobs:
           set -uo pipefail
           STAMP="$(TZ='America/Los_Angeles' date '+%Y-%m-%d %I:%M %p %Z')"
           mkdir -p reports
-          HAVE="$(find log -name '*.json' 2>/dev/null | wc -l | tr -d ' ')"
+          # ---- term scoping: blank SEM = CURRENT term (log/); a past term reads log/archive/<sem>/ ----
+          SEM="$(printf '%s' "${SEM:-}" | tr '[:upper:]' '[:lower:]')"
+          if [ -n "$SEM" ] && [ -d "log/archive/$SEM" ]; then
+            SRC="log/archive/$SEM"; PAST=1; PFX="${SEM}-"; IDXFILE="repo-report-${SEM}.md"
+          else
+            SRC="log"; PAST=0; PFX=""; IDXFILE="repo-report.md"
+          fi
+          HAVE="$(find ${SRC} -maxdepth 1 -name '*.json' 2>/dev/null | wc -l | tr -d ' ')"
           TAB="$(printf '\t')"
           # course matching is CASE-INSENSITIVE: normalize the input + every course to lowercase
           # (so `COMSC240` and `comsc240` are one course).
           ONLY="$(printf '%s' "${ONLY:-}" | tr '[:upper:]' '[:lower:]')"
 
           # validate the course input: a typo must FAIL loudly, not silently produce nothing
-          if [ -n "${ONLY}" ] && [ "$HAVE" -gt 0 ] && ! jq -r '.course|ascii_downcase' log/*.json 2>/dev/null | sort -u | grep -qx "${ONLY}"; then
-            echo "::error::course '${ONLY}' not found. Valid: $(jq -r '.course|ascii_downcase' log/*.json 2>/dev/null | sort -u | paste -sd' ' -)"
+          if [ -n "${ONLY}" ] && [ "$HAVE" -gt 0 ] && ! jq -r '.course|ascii_downcase' ${SRC}/*.json 2>/dev/null | sort -u | grep -qx "${ONLY}"; then
+            echo "::error::course '${ONLY}' not found. Valid: $(jq -r '.course|ascii_downcase' ${SRC}/*.json 2>/dev/null | sort -u | paste -sd' ' -)"
             exit 1
           fi
 
           # ---- build the per-course index BODY once (counts + open links), reused below ----
           : > /tmp/idx_body.md
           if [ "$HAVE" -gt 0 ]; then
-            jq -r '.course|ascii_downcase' log/*.json | sort -u | while read -r course; do
+            jq -r '.course|ascii_downcase' ${SRC}/*.json | sort -u | while read -r course; do
               [ -n "$course" ] || continue
               { echo ""; echo "## ${course}"; echo ""; echo "| Assignment | Submitted | Detail |"; echo "|---|---|---|"; } >> /tmp/idx_body.md
-              jq -r --arg c "$course" 'select((.course|ascii_downcase)==$c) | .assignment' log/*.json | sort -u | while read -r assign; do
+              jq -r --arg c "$course" 'select((.course|ascii_downcase)==$c) | .assignment' ${SRC}/*.json | sort -u | while read -r assign; do
                 [ -n "$assign" ] || continue
-                n="$(jq -r --arg c "$course" --arg a "$assign" 'select((.course|ascii_downcase)==$c and .assignment==$a) | .username' log/*.json | wc -l | tr -d ' ')"
-                echo "| ${assign} | ${n} | [open](reports/${course}-${assign}.md) |" >> /tmp/idx_body.md
+                n="$(jq -r --arg c "$course" --arg a "$assign" 'select((.course|ascii_downcase)==$c and .assignment==$a) | .username' ${SRC}/*.json | wc -l | tr -d ' ')"
+                echo "| ${assign} | ${n} | [open](reports/${PFX}${course}-${assign}.md) |" >> /tmp/idx_body.md
               done
             done
           fi
@@ -69,10 +81,11 @@ jobs:
             echo ""
             echo "_Generated ${STAMP} — refresh: Actions -> repo-report -> Run workflow (enter a course). Total repos: **${HAVE}**._"
             cat /tmp/idx_body.md
-          } > repo-report.md
+          } > "${IDXFILE}"
 
-          # ---- README.md = manual/guide + the SAME index (so the repo landing page shows status) ----
+          # ---- README.md = manual/guide + the SAME index (CURRENT term only; a past-term run skips it) ----
           # (GENERATED every run — edit the guide text in this workflow, not README directly.)
+          if [ "$PAST" = 0 ]; then
           {
             echo "# ${ORG} — Classroom Hub (admin · PRIVATE)"
             echo ""
@@ -86,6 +99,7 @@ jobs:
             echo "## Refresh (manual, per course)"
             echo "- **Actions → \`repo-report\` → Run workflow → enter a course** (e.g. \`cs120\`; case-insensitive) — rebuilds THAT course's pass/fail + score."
             echo "- **Actions → \`roster\` → Run workflow → enter a course** — rebuilds that course's roster."
+            echo "- **Past term**: enter \`semester\` (e.g. \`sp26\`) — reads archived \`log/archive/<term>/\` into \`repo-report-<term>.md\` (current term needs no semester; never overwrites this page)."
             echo "- Per-course on purpose: only the course you run is rebuilt (no all-course overhead)."
             echo ""
             echo "## How to read the status"
@@ -98,6 +112,7 @@ jobs:
             echo "# Submission status"
             cat /tmp/idx_body.md
           } > README.md
+          fi
 
           # ---- autograder result for one repo -> prints "PF<TAB>SCORE" ----
           autograder_result () {
@@ -136,24 +151,24 @@ jobs:
 
           # ---- per course/assignment detail — ONLY the chosen course (blank = all) ----
           if [ "$HAVE" -gt 0 ]; then
-            jq -r '"\(.course|ascii_downcase)\t\(.assignment)"' log/*.json | sort -u | while IFS="$TAB" read -r course assign; do
+            jq -r '"\(.course|ascii_downcase)\t\(.assignment)"' ${SRC}/*.json | sort -u | while IFS="$TAB" read -r course assign; do
               [ -n "$course" ] || continue
               if [ -n "${ONLY}" ] && [ "${ONLY}" != "${course}" ]; then continue; fi
               echo "building ${course}/${assign} ..."
               {
                 echo "# ${course} / ${assign}"
                 echo ""
-                echo "_Generated ${STAMP}_ · [← index](../repo-report.md)"
+                echo "_Generated ${STAMP}_ · [← index](../${IDXFILE})"
                 echo ""
                 echo "| Username | Name | Result | Score | Repo |"
                 echo "|---|---|---|---|---|"
                 jq -r --arg c "$course" --arg a "$assign" '
-                  select((.course|ascii_downcase)==$c and .assignment==$a) | "\(.username)\t\(.name)\t\(.repo)"' log/*.json \
+                  select((.course|ascii_downcase)==$c and .assignment==$a) | "\(.username)\t\(.name)\t\(.repo)"' ${SRC}/*.json \
                   | awk -F"$TAB" '{n=split($2,a," "); print tolower(a[n]) "\t" $0}' | sort -f | cut -f2- \
                   | awk -F"$TAB" '{print NR"\t"$0}' \
                   | xargs -d '\n' -P 8 -n1 bash -c 'build_row "$1"' _ \
                   | sort -t"$TAB" -k1,1n | cut -f2-
-              } > "reports/${course}-${assign}.md"
+              } > "reports/${PFX}${course}-${assign}.md"
             done
           fi
 
@@ -163,7 +178,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "reports unchanged"
           else
-            git commit -m "repo-report: refresh ${STAMP} (course=${ONLY:-all})"
+            git commit -m "repo-report: refresh ${STAMP} (course=${ONLY:-all} term=${SEM:-current})"
             # push with retry: if the remote advanced between checkout and push, rebase + retry
             n=0
             until git push 2>/dev/null; do
