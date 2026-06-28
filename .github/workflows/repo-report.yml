@@ -35,7 +35,7 @@ jobs:
       - name: Build repo-report (index + per course/assignment detail with pass/fail + score)
         run: |
           set -uo pipefail
-          STAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          STAMP="$(TZ='America/Los_Angeles' date '+%Y-%m-%d %I:%M %p %Z')"
           mkdir -p reports
           HAVE="$(find log -name '*.json' 2>/dev/null | wc -l | tr -d ' ')"
           TAB="$(printf '\t')"
@@ -67,7 +67,7 @@ jobs:
           {
             echo "# Submission Report — Index"
             echo ""
-            echo "_Generated ${STAMP} UTC — refresh: Actions -> repo-report -> Run workflow (enter a course). Total repos: **${HAVE}**._"
+            echo "_Generated ${STAMP} — refresh: Actions -> repo-report -> Run workflow (enter a course). Total repos: **${HAVE}**._"
             cat /tmp/idx_body.md
           } > repo-report.md
 
@@ -92,7 +92,7 @@ jobs:
             echo "- **Result**: ✅ pass / ❌ fail = the latest push run's autograder conclusion."
             echo "- **Score**: autograder \`totalPoints/maxPoints\` parsed from the run log."
             echo ""
-            echo "_Status generated ${STAMP} UTC · total repos: **${HAVE}**._"
+            echo "_Status generated ${STAMP} · total repos: **${HAVE}**._"
             echo ""
             echo "---"
             echo "# Submission status"
@@ -143,7 +143,7 @@ jobs:
               {
                 echo "# ${course} / ${assign}"
                 echo ""
-                echo "_Generated ${STAMP} UTC_ · [← index](../repo-report.md)"
+                echo "_Generated ${STAMP}_ · [← index](../repo-report.md)"
                 echo ""
                 echo "| Username | Name | Result | Score | Repo |"
                 echo "|---|---|---|---|---|"

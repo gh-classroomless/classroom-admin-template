@@ -32,7 +32,7 @@ jobs:
       - name: Build roster index + per-course roster + per-student repo list
         run: |
           set -uo pipefail
-          STAMP="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          STAMP="$(TZ='America/Los_Angeles' date '+%Y-%m-%d %I:%M %p %Z')"
           mkdir -p reports
           HAVE="$(find log -name '*.json' 2>/dev/null | wc -l | tr -d ' ')"
           TAB="$(printf '\t')"
@@ -50,7 +50,7 @@ jobs:
           {
             echo "# Roster — Index"
             echo ""
-            echo "_Generated ${STAMP} UTC — refresh: Actions -> roster -> Run workflow._"
+            echo "_Generated ${STAMP} — refresh: Actions -> roster -> Run workflow._"
             jq -r '.course|ascii_downcase' log/*.json | sort -u | while read -r course; do
               [ -n "$course" ] || continue
               n="$(jq -r --arg c "$course" 'select((.course|ascii_downcase)==$c)|.username' log/*.json | sort -u | wc -l | tr -d ' ')"
@@ -68,7 +68,7 @@ jobs:
             {
               echo "# ${course} — Roster"
               echo ""
-              echo "_Generated ${STAMP} UTC_ · [← index](../roster.md)"
+              echo "_Generated ${STAMP}_ · [← index](../roster.md)"
               echo ""
               echo "| Name | Username | Email | Repos |"
               echo "|---|---|---|---|"
@@ -87,7 +87,7 @@ jobs:
               {
                 echo "# ${course} / ${username} — repos"
                 echo ""
-                echo "_Generated ${STAMP} UTC_ · [← roster](${course}-roster.md)"
+                echo "_Generated ${STAMP}_ · [← roster](${course}-roster.md)"
                 echo ""
                 echo "| Assignment | Repo |"
                 echo "|---|---|"
