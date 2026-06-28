@@ -112,15 +112,27 @@ jobs:
               *)       pf="… ${concl}";;
             esac
             if [ -n "$runid" ]; then
-              if gh api "/repos/${ORG}/${repo}/actions/runs/${runid}/logs" > /tmp/rl.zip 2>/dev/null && [ -s /tmp/rl.zip ]; then
-                tp="$(unzip -p /tmp/rl.zip 2>/dev/null | grep -oE '"totalPoints": *[0-9]+' | tail -1 | grep -oE '[0-9]+' || true)"
-                mp="$(unzip -p /tmp/rl.zip 2>/dev/null | grep -oE '"maxPoints": *[0-9]+'   | tail -1 | grep -oE '[0-9]+' || true)"
+              z="$(mktemp)"                              # unique per call -> parallel-safe
+              if gh api "/repos/${ORG}/${repo}/actions/runs/${runid}/logs" > "$z" 2>/dev/null && [ -s "$z" ]; then
+                L="$(unzip -p "$z" 2>/dev/null)"         # decompress once
+                tp="$(printf '%s' "$L" | grep -oE '"totalPoints": *[0-9]+' | tail -1 | grep -oE '[0-9]+' || true)"
+                mp="$(printf '%s' "$L" | grep -oE '"maxPoints": *[0-9]+'   | tail -1 | grep -oE '[0-9]+' || true)"
                 [ -n "$tp" ] && [ -n "$mp" ] && score="${tp}/${mp}"
               fi
-              rm -f /tmp/rl.zip
+              rm -f "$z"
             fi
             printf '%s\t%s' "$pf" "$score"
           }
+
+          # build one markdown row, preserving sort index (for parallel reassembly)
+          build_row () {
+            IFS="$TAB" read -r idx username name repo <<< "$1"
+            [ -n "$repo" ] || return 0
+            res="$(autograder_result "$repo")"; pf="${res%%${TAB}*}"; score="${res##*${TAB}}"
+            printf '%s\t| %s | %s | %s | %s | [%s](https://github.com/%s/%s) |\n' \
+              "$idx" "$username" "$name" "$pf" "$score" "$repo" "$ORG" "$repo"
+          }
+          export -f autograder_result build_row; export ORG TAB
 
           # ---- per course/assignment detail — ONLY the chosen course (blank = all) ----
           if [ "$HAVE" -gt 0 ]; then
@@ -137,13 +149,10 @@ jobs:
                 echo "|---|---|---|---|---|"
                 jq -r --arg c "$course" --arg a "$assign" '
                   select((.course|ascii_downcase)==$c and .assignment==$a) | "\(.username)\t\(.name)\t\(.repo)"' log/*.json \
-                  | awk -F"$TAB" '{n=split($2,a," "); print tolower(a[n]) "\t" $0}' | sort -f | cut -f2- | \
-                while IFS="$TAB" read -r username name repo; do
-                  [ -n "$repo" ] || continue
-                  res="$(autograder_result "$repo")"
-                  pf="${res%%${TAB}*}"; score="${res##*${TAB}}"
-                  echo "| ${username} | ${name} | ${pf} | ${score} | [${repo}](https://github.com/${ORG}/${repo}) |"
-                done
+                  | awk -F"$TAB" '{n=split($2,a," "); print tolower(a[n]) "\t" $0}' | sort -f | cut -f2- \
+                  | awk -F"$TAB" '{print NR"\t"$0}' \
+                  | xargs -d '\n' -P 8 -n1 bash -c 'build_row "$1"' _ \
+                  | sort -t"$TAB" -k1,1n | cut -f2-
               } > "reports/${course}-${assign}.md"
             done
           fi
