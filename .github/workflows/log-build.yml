@@ -51,15 +51,21 @@ jobs:
           STAMP="$(TZ='America/Los_Angeles' date '+%Y-%m-%d %I:%M %p %Z')"
           mkdir -p log
 
-          # ONE call fetches number+title+body for every pending record. Per-issue `gh issue view`
-          # would be N+1 calls where a single network blip yields an empty body — indistinguishable
-          # from a malformed record. Fetching the bodies with the list makes partial failure
-          # impossible: either the whole list arrives or the step fails loudly.
-          gh issue list --repo "$REPO" --state open --limit 1000 \
-            --search 'in:title "log:"' --json number,title,body > /tmp/pending.json \
+          # REST, not `gh issue list --json` (GraphQL): GraphQL runs on a separate, much smaller
+          # quota, and when it is exhausted the call fails — the same trap that made request.yml
+          # report a present template as "not found" (2026-07-20). REST already returns `body` with
+          # each issue, so this is still ONE call, not the N+1 that a per-issue `gh issue view`
+          # would cost (where a single blip yields an empty body, indistinguishable from a
+          # malformed record). Either the whole page arrives or the step fails loudly below.
+          # `--jq '.[]'` flattens every page into one object per line, so --paginate's concatenated
+          # arrays never need slurping. `select(.pull_request|not)` drops PRs — the REST /issues
+          # endpoint returns them alongside issues (the GraphQL helper filtered them for us).
+          gh api "repos/$REPO/issues?state=open&per_page=100" --paginate \
+            --jq '.[] | select(.pull_request | not) | select(.title | startswith("log: "))' \
+            > /tmp/pending.jsonl \
             || { echo "::error::could not list log issues"; exit 1; }
 
-          N="$(jq '[.[] | select(.title | startswith("log: "))] | length' /tmp/pending.json)"
+          N="$(wc -l < /tmp/pending.jsonl | tr -d ' ')"
           echo "pending log issues: $N"
           [ "$N" -gt 0 ] || { echo "nothing to drain"; exit 0; }
 
@@ -67,7 +73,7 @@ jobs:
           : > /tmp/done.txt
           # Emit "<number>\t<compact-json-body>" per record; the body is single-line JSON by
           # construction (request.yml builds it with `jq -nc`), so a tab-split is safe.
-          jq -r '.[] | select(.title | startswith("log: ")) | "\(.number)\t\(.body)"' /tmp/pending.json \
+          jq -r '"\(.number)\t\(.body)"' /tmp/pending.jsonl \
           | while IFS="$(printf '\t')" read -r num body; do
             [ -n "${num:-}" ] || continue
             # The body must be the exact JSON record request.yml built. A malformed body is left
