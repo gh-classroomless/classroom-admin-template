@@ -1,0 +1,123 @@
+name: log-build
+
+# Drain the provisioning records that request.yml files here as ISSUES into log/*.json.
+#
+# Why issues and not a commit from request.yml: a Contents-API commit takes a branch-head lock, so
+# concurrent student requests collide (HTTP 409) and — unguarded under set -e — killed the run before
+# it could notify the student (2026-07-19 DVC-COMSC: 21 runs, 5 students, up to 3h silent). Issue
+# creation takes no lock, so the student path never contends. This workflow is the ONLY writer of
+# log/, runs alone, and turns N racing commits into ONE.
+#
+# Run it manually (Actions -> log-build -> Run workflow), or let roster / repo-report call it first
+# so their .md output is built on current data. Never trigger it per-issue: N concurrent drains would
+# re-create exactly the branch-head contention this design removes.
+on:
+  workflow_dispatch:
+    inputs:
+      close_issues:
+        description: "Close the log issues after writing them (uncheck for a dry run)."
+        type: boolean
+        required: false
+        default: true
+  workflow_call:
+    inputs:
+      close_issues:
+        type: boolean
+        required: false
+        default: true
+
+# Same serialization group as roster / repo-report so admin commits never push concurrently.
+concurrency:
+  group: classroom-admin-report
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  log-build:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+      REPO: ${{ github.repository }}
+      CLOSE: ${{ inputs.close_issues }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Drain "log:" issues into log/*.json
+        run: |
+          set -uo pipefail
+          STAMP="$(TZ='America/Los_Angeles' date '+%Y-%m-%d %I:%M %p %Z')"
+          mkdir -p log
+
+          # ONE call fetches number+title+body for every pending record. Per-issue `gh issue view`
+          # would be N+1 calls where a single network blip yields an empty body — indistinguishable
+          # from a malformed record. Fetching the bodies with the list makes partial failure
+          # impossible: either the whole list arrives or the step fails loudly.
+          gh issue list --repo "$REPO" --state open --limit 1000 \
+            --search 'in:title "log:"' --json number,title,body > /tmp/pending.json \
+            || { echo "::error::could not list log issues"; exit 1; }
+
+          N="$(jq '[.[] | select(.title | startswith("log: "))] | length' /tmp/pending.json)"
+          echo "pending log issues: $N"
+          [ "$N" -gt 0 ] || { echo "nothing to drain"; exit 0; }
+
+          WROTE=0; SKIPPED=0; BAD=0
+          : > /tmp/done.txt
+          # Emit "<number>\t<compact-json-body>" per record; the body is single-line JSON by
+          # construction (request.yml builds it with `jq -nc`), so a tab-split is safe.
+          jq -r '.[] | select(.title | startswith("log: ")) | "\(.number)\t\(.body)"' /tmp/pending.json \
+          | while IFS="$(printf '\t')" read -r num body; do
+            [ -n "${num:-}" ] || continue
+            # The body must be the exact JSON record request.yml built. A malformed body is left
+            # OPEN and reported — never written, never silently dropped.
+            if ! printf '%s' "$body" | jq -e '.repo and .username and .course and .assignment' >/dev/null 2>&1; then
+              echo "::warning::issue #$num: body is not a valid log record — left open"
+              BAD=$((BAD+1)); continue
+            fi
+            rname="$(printf '%s' "$body" | jq -r '.repo')"
+            if [ -f "log/$rname.json" ]; then
+              # Already recorded (e.g. a student re-requested an existing repo). Idempotent: keep the
+              # earlier record, close the issue.
+              SKIPPED=$((SKIPPED+1))
+            else
+              printf '%s\n' "$body" | jq -S . > "log/$rname.json"
+              WROTE=$((WROTE+1))
+            fi
+            echo "$num" >> /tmp/done.txt
+          done
+          # The loop runs in a subshell (pipe), so recount from what it actually produced.
+          DONE="$(wc -l < /tmp/done.txt | tr -d ' ')"
+          echo "processed=$DONE of $N"
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A log
+          if git diff --cached --quiet; then
+            echo "log unchanged"
+          else
+            ADDED="$(git diff --cached --name-only --diff-filter=A | wc -l | tr -d ' ')"
+            git commit -m "log-build: +${ADDED} record(s) ${STAMP}"
+            # push with retry: if the remote advanced between checkout and push, rebase + retry
+            n=0
+            until git push 2>/dev/null; do
+              n=$((n+1)); [ "$n" -gt 4 ] && { echo "::error::git push failed after $n retries"; exit 1; }
+              echo "push rejected — syncing remote then retrying ($n)..."
+              git pull --rebase --autostash --no-edit 2>/dev/null || true
+              sleep $((n*2))
+            done
+          fi
+
+          # Close ONLY after the records are safely pushed — a failed push above exits non-zero and
+          # leaves every issue open, so nothing is ever lost.
+          if [ "$CLOSE" = "true" ]; then
+            while read -r num; do
+              [ -n "${num:-}" ] || continue
+              gh issue close "$num" --repo "$REPO" --comment "recorded in log/ by log-build ($STAMP)" >/dev/null 2>&1 \
+                || echo "::warning::could not close issue #$num"
+            done < /tmp/done.txt
+            echo "closed $DONE issue(s)"
+          else
+            echo "dry run — issues left open"
+          fi
