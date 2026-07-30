@@ -6,6 +6,10 @@ name: repo-report
 # Reading OTHER repos' Actions needs ORG_REPO_TOKEN (a PAT with org actions:read) — the default
 # GITHUB_TOKEN is scoped to THIS repo only and cannot read student repos' runs.
 on:
+  # Scheduled off-hours: a full repo-report costs ~1,340 REST calls of the
+  # shared token's 5,000/hr, so it must not compete with student repo requests.
+  schedule:
+    - cron: "20 12 * * *"  # 05:20 America/Los_Angeles (PDT) — after log-build wrote log/*.json
   workflow_dispatch:
     inputs:
       course:
@@ -166,7 +170,7 @@ jobs:
                   select((.course|ascii_downcase)==$c and .assignment==$a) | "\(.username)\t\(.name)\t\(.repo)"' ${SRC}/*.json \
                   | awk -F"$TAB" '{n=split($2,a," "); print tolower(a[n]) "\t" $0}' | sort -f | cut -f2- \
                   | awk -F"$TAB" '{print NR"\t"$0}' \
-                  | xargs -d '\n' -P 8 -n1 bash -c 'build_row "$1"' _ \
+                  | xargs -d '\n' -P 64 -n1 bash -c 'build_row "$1"' _ \
                   | sort -t"$TAB" -k1,1n | cut -f2-
               } > "reports/${PFX}${course}-${assign}.md"
             done

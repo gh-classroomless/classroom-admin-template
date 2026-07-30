@@ -12,6 +12,10 @@ name: log-build
 # so their .md output is built on current data. Never trigger it per-issue: N concurrent drains would
 # re-create exactly the branch-head contention this design removes.
 on:
+  # Scheduled off-hours: a full repo-report costs ~1,340 REST calls of the
+  # shared token's 5,000/hr, so it must not compete with student repo requests.
+  schedule:
+    - cron: "0 12 * * *"   # 05:00 America/Los_Angeles (PDT) — drain the night's log issues
   workflow_dispatch:
     inputs:
       close_issues:
