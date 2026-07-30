@@ -170,7 +170,7 @@ jobs:
                   select((.course|ascii_downcase)==$c and .assignment==$a) | "\(.username)\t\(.name)\t\(.repo)"' ${SRC}/*.json \
                   | awk -F"$TAB" '{n=split($2,a," "); print tolower(a[n]) "\t" $0}' | sort -f | cut -f2- \
                   | awk -F"$TAB" '{print NR"\t"$0}' \
-                  | xargs -d '\n' -P 64 -n1 bash -c 'build_row "$1"' _ \
+                  | xargs -d '\n' -P 32 -n1 bash -c 'build_row "$1"' _ \
                   | sort -t"$TAB" -k1,1n | cut -f2-
               } > "reports/${PFX}${course}-${assign}.md"
             done
