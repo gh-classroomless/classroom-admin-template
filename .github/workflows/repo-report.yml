@@ -16,10 +16,15 @@ on:
         description: "Course to rebuild (e.g. cs120; case-insensitive). Blank = ALL courses (slow)."
         required: false
         default: ""
-      semester:
-        description: "Term to view (e.g. sp26). Blank = CURRENT term. A past term reads log/archive/<term>/ and writes separate files (does not touch the live README/index)."
+  workflow_call:   # archive-term calls it for the final snapshot before freezing a term
+    inputs:
+      course:
+        type: string
         required: false
         default: ""
+    secrets:
+      ORG_REPO_TOKEN:
+        required: false
 
 # Serialize ALL admin report commits (repo-report + roster share this group) so two runs never
 # push to the same branch at once (a concurrent push is rejected non-fast-forward).
@@ -32,27 +37,27 @@ permissions:
 
 jobs:
   repo-report:
+    # The template repo has no students: never run there (the nightly schedule used to commit a
+    # generated README.md + repo-report.md into the template itself).
+    if: github.repository != 'gh-classroomless/classroom-admin-template'
     runs-on: ubuntu-latest
     env:
       ORG: ${{ github.repository_owner }}
       GH_TOKEN: ${{ secrets.ORG_REPO_TOKEN }}   # cross-repo actions:read for `gh api`
       ONLY: ${{ inputs.course }}
-      SEM: ${{ inputs.semester }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch || 'main' }}   # tip, not the triggering sha (archive-term calls this after other commits)
 
       - name: Build repo-report (index + per course/assignment detail with pass/fail + score)
         run: |
           set -uo pipefail
           STAMP="$(TZ='America/Los_Angeles' date '+%Y-%m-%d %I:%M %p %Z')"
           mkdir -p reports
-          # ---- term scoping: blank SEM = CURRENT term (log/); a past term reads log/archive/<sem>/ ----
-          SEM="$(printf '%s' "${SEM:-}" | tr '[:upper:]' '[:lower:]')"
-          if [ -n "$SEM" ] && [ -d "log/archive/$SEM" ]; then
-            SRC="log/archive/$SEM"; PAST=1; PFX="${SEM}-"; IDXFILE="repo-report-${SEM}.md"
-          else
-            SRC="log"; PAST=0; PFX=""; IDXFILE="repo-report.md"
-          fi
+          # The current term is whatever is in top-level log/. A finished term was moved to
+          # archive/<term>/ by archive-term, together with the pages built from it.
+          SRC="log"; IDXFILE="repo-report.md"
           HAVE="$(find ${SRC} -maxdepth 1 -name '*.json' 2>/dev/null | wc -l | tr -d ' ')"
           TAB="$(printf '\t')"
           # course matching is CASE-INSENSITIVE: normalize the input + every course to lowercase
@@ -74,7 +79,7 @@ jobs:
               jq -r --arg c "$course" 'select((.course|ascii_downcase)==$c) | .assignment' ${SRC}/*.json | sort -u | while read -r assign; do
                 [ -n "$assign" ] || continue
                 n="$(jq -r --arg c "$course" --arg a "$assign" 'select((.course|ascii_downcase)==$c and .assignment==$a) | .username' ${SRC}/*.json | wc -l | tr -d ' ')"
-                echo "| ${assign} | ${n} | [open](reports/${PFX}${course}-${assign}.md) |" >> /tmp/idx_body.md
+                echo "| ${assign} | ${n} | [open](reports/${course}-${assign}.md) |" >> /tmp/idx_body.md
               done
             done
           fi
@@ -87,9 +92,8 @@ jobs:
             cat /tmp/idx_body.md
           } > "${IDXFILE}"
 
-          # ---- README.md = manual/guide + the SAME index (CURRENT term only; a past-term run skips it) ----
+          # ---- README.md = manual/guide + the SAME index ----
           # (GENERATED every run — edit the guide text in this workflow, not README directly.)
-          if [ "$PAST" = 0 ]; then
           {
             echo "# ${ORG} — Classroom Hub (admin · PRIVATE)"
             echo ""
@@ -103,7 +107,7 @@ jobs:
             echo "## Refresh (manual, per course)"
             echo "- **Actions → \`repo-report\` → Run workflow → enter a course** (e.g. \`cs120\`; case-insensitive) — rebuilds THAT course's pass/fail + score."
             echo "- **Actions → \`roster\` → Run workflow → enter a course** — rebuilds that course's roster."
-            echo "- **Past term**: enter \`semester\` (e.g. \`sp26\`) — reads archived \`log/archive/<term>/\` into \`repo-report-<term>.md\` (current term needs no semester; never overwrites this page)."
+            echo "- **Past terms**: open \`archive/<term>/\` — each finished term's \`repo-report.md\`, \`roster.md\`, \`reports/\` and \`log/\`, frozen by **Actions → \`archive-term\`**."
             echo "- Per-course on purpose: only the course you run is rebuilt (no all-course overhead)."
             echo ""
             echo "## How to read the status"
@@ -116,7 +120,6 @@ jobs:
             echo "# Submission status"
             cat /tmp/idx_body.md
           } > README.md
-          fi
 
           # ---- autograder result for one repo -> prints "PF<TAB>SCORE" ----
           autograder_result () {
@@ -172,7 +175,7 @@ jobs:
                   | awk -F"$TAB" '{print NR"\t"$0}' \
                   | xargs -d '\n' -P 32 -n1 bash -c 'build_row "$1"' _ \
                   | sort -t"$TAB" -k1,1n | cut -f2-
-              } > "reports/${PFX}${course}-${assign}.md"
+              } > "reports/${course}-${assign}.md"
             done
           fi
 
@@ -182,7 +185,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "reports unchanged"
           else
-            git commit -m "repo-report: refresh ${STAMP} (course=${ONLY:-all} term=${SEM:-current})"
+            git commit -m "repo-report: refresh ${STAMP} (course=${ONLY:-all})"
             # push with retry: if the remote advanced between checkout and push, rebase + retry
             n=0
             until git push 2>/dev/null; do

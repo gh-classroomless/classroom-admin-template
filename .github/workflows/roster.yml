@@ -1,9 +1,10 @@
 name: roster
 
 # Manual roster build. Instructor: Actions -> roster -> Run workflow (optional `course`, case-insensitive).
-# Builds per-course student rosters from ${SRC}/*.json (the org-hub provisioning records). Each
+# Builds per-course student rosters from log/*.json (the CURRENT term's provisioning records). Each
 # student NAME links to a per-student page listing all that student's repos for the course.
 # log-based ONLY — NO Actions/autograder calls (pass/fail lives in repo-report). Cheap & fast.
+# Past terms are not rebuilt here: archive-term froze each one under archive/<term>/.
 on:
   workflow_dispatch:
     inputs:
@@ -11,8 +12,10 @@ on:
         description: "Course to rebuild (e.g. cs120; case-insensitive). Blank = ALL courses."
         required: false
         default: ""
-      semester:
-        description: "Term to view (e.g. sp26). Blank = CURRENT term. A past term reads log/archive/<term>/ and writes separate files (does not touch the live roster.md)."
+  workflow_call:   # archive-term calls it for the final snapshot before freezing a term
+    inputs:
+      course:
+        type: string
         required: false
         default: ""
 
@@ -26,26 +29,26 @@ permissions:
 
 jobs:
   roster:
+    # The template repo has no students: never run there (it would commit generated pages into
+    # the template, and every school generated from it would start with them).
+    if: github.repository != 'gh-classroomless/classroom-admin-template'
     runs-on: ubuntu-latest
     env:
       ORG: ${{ github.repository_owner }}
       ONLY: ${{ inputs.course }}
-      SEM: ${{ inputs.semester }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch || 'main' }}   # tip, not the triggering sha (archive-term calls this after other commits)
 
       - name: Build roster index + per-course roster + per-student repo list
         run: |
           set -uo pipefail
           STAMP="$(TZ='America/Los_Angeles' date '+%Y-%m-%d %I:%M %p %Z')"
           mkdir -p reports
-          # ---- term scoping: blank SEM = CURRENT term (log/); a past term reads log/archive/<sem>/ ----
-          SEM="$(printf '%s' "${SEM:-}" | tr '[:upper:]' '[:lower:]')"
-          if [ -n "$SEM" ] && [ -d "log/archive/$SEM" ]; then
-            SRC="log/archive/$SEM"; PAST=1; PFX="${SEM}-"; IDXFILE="roster-${SEM}.md"
-          else
-            SRC="log"; PAST=0; PFX=""; IDXFILE="roster.md"
-          fi
+          # The current term is whatever is in top-level log/. A finished term was moved to
+          # archive/<term>/ by archive-term, together with the pages built from it.
+          SRC="log"; IDXFILE="roster.md"
           HAVE="$(find ${SRC} -maxdepth 1 -name '*.json' 2>/dev/null | wc -l | tr -d ' ')"
           TAB="$(printf '\t')"
           [ "$HAVE" -gt 0 ] || { echo "no ${SRC}/*.json"; exit 0; }
@@ -67,7 +70,7 @@ jobs:
               [ -n "$course" ] || continue
               n="$(jq -r --arg c "$course" 'select((.course|ascii_downcase)==$c)|.username' ${SRC}/*.json | sort -u | wc -l | tr -d ' ')"
               echo ""
-              echo "## ${course} — ${n} students · [roster](reports/${PFX}${course}-roster.md)"
+              echo "## ${course} — ${n} students · [roster](reports/${course}-roster.md)"
             done
           } > "${IDXFILE}"
 
@@ -90,16 +93,16 @@ jobs:
                 | awk -F"$TAB" '{n=split($2,a," "); print tolower(a[n]) "\t" $0}' | sort -f | cut -f2- | \
               while IFS="$TAB" read -r username name email; do
                 [ -n "$username" ] || continue
-                echo "| [${name}](${PFX}${course}-student-${username}.md) | ${username} | ${email} | [repos](${PFX}${course}-student-${username}.md) |"
+                echo "| [${name}](${course}-student-${username}.md) | ${username} | ${email} | [repos](${course}-student-${username}.md) |"
               done
-            } > "reports/${PFX}${course}-roster.md"
+            } > "reports/${course}-roster.md"
             # per-student page: all repos this student has in the course
             jq -r --arg c "$course" 'select((.course|ascii_downcase)==$c)|.username' ${SRC}/*.json | sort -u | while read -r username; do
               [ -n "$username" ] || continue
               {
                 echo "# ${course} / ${username} — repos"
                 echo ""
-                echo "_Generated ${STAMP}_ · [← roster](${PFX}${course}-roster.md)"
+                echo "_Generated ${STAMP}_ · [← roster](${course}-roster.md)"
                 echo ""
                 echo "| Assignment | Repo |"
                 echo "|---|---|"
@@ -108,7 +111,7 @@ jobs:
                   [ -n "$repo" ] || continue
                   echo "| ${assign} | [${repo}](https://github.com/${ORG}/${repo}) |"
                 done
-              } > "reports/${PFX}${course}-student-${username}.md"
+              } > "reports/${course}-student-${username}.md"
             done
           done
 
@@ -118,7 +121,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "roster unchanged"
           else
-            git commit -m "roster: refresh ${STAMP} (course=${ONLY:-all} term=${SEM:-current})"
+            git commit -m "roster: refresh ${STAMP} (course=${ONLY:-all})"
             # push with retry: if the remote advanced between checkout and push, rebase + retry
             n=0
             until git push 2>/dev/null; do

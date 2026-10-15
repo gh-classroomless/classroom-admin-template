@@ -1,0 +1,131 @@
+name: archive-term
+run-name: archive-term ${{ inputs.term }}
+
+# End of term: freeze a FINISHED term under archive/<term>/ so the live pages start the next term empty.
+#
+#   moved to archive/<term>/ : log/*.json · reports/* · roster.md · repo-report.md
+#   never moved              : roster/ (registrations accumulate across terms) · quiz-codes.json ·
+#                              README.md (rebuilt by the next repo-report run) · .github/
+#
+# Order at term end:
+#   1. In <org>/classroom/config.json, move every course off the finished term (bump its semester,
+#      or remove-course). While ANY course is still on the term, this workflow refuses.
+#   2. Actions -> archive-term -> Run workflow -> the finished term (e.g. su26).
+#      Run it before the next 05:00 log-build drains new-term requests; once log/ holds another
+#      term's records too, the final check below refuses.
+#
+# Refusals (nothing is moved): a course in config.json is still on the term · config.json cannot be
+# read · log/ holds no record of the term · log/ holds records of another term · archive/<term>/ exists.
+# Before moving, it runs log-build -> roster -> repo-report so the frozen pages are the final ones.
+on:
+  workflow_dispatch:
+    inputs:
+      term:
+        description: "The FINISHED term to archive (e.g. su26). Refused while any course in <org>/classroom/config.json is still on it."
+        required: true
+
+permissions:
+  contents: write
+  issues: write   # log-build (called below) closes the drained log issues
+
+jobs:
+  guard:
+    # The template repo has no students: never run there.
+    if: github.repository != 'gh-classroomless/classroom-admin-template'
+    runs-on: ubuntu-latest
+    outputs:
+      term: ${{ steps.check.outputs.term }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: check
+        name: Refuse unless the term is finished in config.json and log/ holds only that term
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TERM_IN: ${{ inputs.term }}
+        run: |
+          set -uo pipefail
+          shopt -s nullglob
+          T="$(printf '%s' "$TERM_IN" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
+          [[ "$T" =~ ^[a-z0-9][a-z0-9_-]*$ ]] || { echo "::error::term '$TERM_IN' is not a plain term name (e.g. su26)"; exit 1; }
+
+          # 1. config.json of the public hub (<org>/classroom; this repo is <org>/classroom-admin)
+          HUB="${GITHUB_REPOSITORY%-admin}"
+          [ "$HUB" != "$GITHUB_REPOSITORY" ] || { echo "::error::this repo is not named <hub>-admin; cannot find the hub"; exit 1; }
+          CFG="$(gh api "repos/$HUB/contents/config.json" --jq .content 2>/dev/null | base64 -d 2>/dev/null)"
+          printf '%s' "$CFG" | jq -e '.courses | type == "object"' >/dev/null 2>&1 \
+            || { echo "::error::cannot read $HUB/config.json — refusing (the term cannot be proven finished)"; exit 1; }
+          STILL="$(printf '%s' "$CFG" | jq -r --arg t "$T" '.courses | to_entries[] | select((.value.semester // "" | ascii_downcase) == $t) | .key' | paste -sd' ' -)"
+          [ -z "$STILL" ] || { echo "::error::$HUB/config.json still has course(s) on $T: $STILL — move them to the next term first"; exit 1; }
+
+          # 2. log/ holds this term, and only this term
+          FILES=(log/*.json)
+          [ "${#FILES[@]}" -gt 0 ] || { echo "::error::log/ is empty — nothing to archive"; exit 1; }
+          OTHER="$(jq -r '.semester // "MISSING" | ascii_downcase' "${FILES[@]}" | sort | uniq -c | awk -v t="$T" '$2 != t' | paste -sd',' -)"
+          MINE="$(jq -r '.semester // "" | ascii_downcase' "${FILES[@]}" | grep -cx "$T")"
+          [ "$MINE" -gt 0 ] || { echo "::error::log/ has no record of term $T (found: $OTHER)"; exit 1; }
+          [ -z "$OTHER" ] || { echo "::error::log/ also holds other terms ($OTHER) — archive needs log/ to hold only $T"; exit 1; }
+
+          # 3. never merge into an existing archive
+          [ ! -e "archive/$T" ] || { echo "::error::archive/$T already exists"; exit 1; }
+
+          echo "term $T: $MINE log record(s), config clear — taking the final snapshot, then archiving"
+          echo "term=$T" >> "$GITHUB_OUTPUT"
+
+  log-build:
+    needs: guard
+    uses: ./.github/workflows/log-build.yml
+
+  roster:
+    needs: log-build
+    uses: ./.github/workflows/roster.yml
+
+  repo-report:
+    needs: roster
+    uses: ./.github/workflows/repo-report.yml
+    secrets: inherit
+
+  archive:
+    needs: [guard, repo-report]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch || 'main' }}   # the tip, after the snapshot commits
+
+      - name: Move the term into archive/<term>/
+        env:
+          T: ${{ needs.guard.outputs.term }}
+        run: |
+          set -uo pipefail
+          shopt -s nullglob
+          STAMP="$(TZ='America/Los_Angeles' date '+%Y-%m-%d %I:%M %p %Z')"
+          DEST="archive/$T"
+          # Re-check: log-build may have drained records of the next term since the guard ran.
+          FILES=(log/*.json)
+          [ "${#FILES[@]}" -gt 0 ] || { echo "::error::log/ is empty — nothing to archive"; exit 1; }
+          OTHER="$(jq -r '.semester // "MISSING" | ascii_downcase' "${FILES[@]}" | sort | uniq -c | awk -v t="$T" '$2 != t' | paste -sd',' -)"
+          [ -z "$OTHER" ] || { echo "::error::log/ now also holds other terms ($OTHER) — nothing moved"; exit 1; }
+          [ ! -e "$DEST" ] || { echo "::error::$DEST already exists — nothing moved"; exit 1; }
+
+          mkdir -p "$DEST/log" "$DEST/reports"
+          for f in "${FILES[@]}"; do git mv "$f" "$DEST/log/"; done
+          for f in reports/*; do
+            [ "$(basename "$f")" = ".gitkeep" ] && continue
+            git mv "$f" "$DEST/reports/"
+          done
+          for f in roster.md repo-report.md; do
+            [ -f "$f" ] && git mv "$f" "$DEST/$f"
+          done
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -q -m "archive-term: freeze $T into $DEST/ (${#FILES[@]} log records) $STAMP"
+          n=0
+          until git push 2>/dev/null; do
+            n=$((n+1)); [ "$n" -gt 4 ] && { echo "::error::git push failed after $n retries"; exit 1; }
+            echo "push rejected — syncing remote then retrying ($n)..."
+            git pull --rebase --autostash --no-edit 2>/dev/null || true
+            sleep $((n*2))
+          done
+          echo "archived $T: ${#FILES[@]} log records -> $DEST/"
