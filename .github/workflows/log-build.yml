@@ -17,18 +17,10 @@ on:
   schedule:
     - cron: "0 12 * * *"   # 05:00 America/Los_Angeles (PDT) — drain the night's log issues
   workflow_dispatch:
-    inputs:
-      close_issues:
-        description: "Close the log issues after writing them (uncheck for a dry run)."
-        type: boolean
-        required: false
-        default: true
   workflow_call:
-    inputs:
-      close_issues:
-        type: boolean
-        required: false
-        default: true
+  # No "close the issues?" input. It existed for a manual dry run, and the nightly schedule — which
+  # has no inputs — read it as empty and never closed anything (51 issues re-read every night on
+  # LPC-CSDept, 2026-10-15). A recorded issue is always closed; see the close step below.
 
 # Same serialization group as roster / repo-report so admin commits never push concurrently.
 concurrency:
@@ -47,7 +39,6 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
       REPO: ${{ github.repository }}
-      CLOSE: ${{ inputs.close_issues }}
     steps:
       - uses: actions/checkout@v4
 
@@ -122,14 +113,11 @@ jobs:
           fi
 
           # Close ONLY after the records are safely pushed — a failed push above exits non-zero and
-          # leaves every issue open, so nothing is ever lost.
-          if [ "$CLOSE" = "true" ]; then
-            while read -r num; do
-              [ -n "${num:-}" ] || continue
-              gh issue close "$num" --repo "$REPO" --comment "recorded in log/ by log-build ($STAMP)" >/dev/null 2>&1 \
-                || echo "::warning::could not close issue #$num"
-            done < /tmp/done.txt
-            echo "closed $DONE issue(s)"
-          else
-            echo "dry run — issues left open"
-          fi
+          # leaves every issue open, so nothing is ever lost. Only issues whose record is in log/
+          # (/tmp/done.txt) are closed; a malformed one stays open. A closed issue is not deleted.
+          while read -r num; do
+            [ -n "${num:-}" ] || continue
+            gh issue close "$num" --repo "$REPO" --comment "recorded in log/ by log-build ($STAMP)" >/dev/null 2>&1 \
+              || echo "::warning::could not close issue #$num"
+          done < /tmp/done.txt
+          echo "closed $DONE issue(s)"
