@@ -52,7 +52,9 @@ jobs:
           # 1. config.json of the public hub (<org>/classroom; this repo is <org>/classroom-admin)
           HUB="${GITHUB_REPOSITORY%-admin}"
           [ "$HUB" != "$GITHUB_REPOSITORY" ] || { echo "::error::this repo is not named <hub>-admin; cannot find the hub"; exit 1; }
-          CFG="$(gh api "repos/$HUB/contents/config.json" --jq .content 2>/dev/null | base64 -d 2>/dev/null)"
+          # (Actions runs this under `bash -e`: every expected failure is caught explicitly, or the
+          #  step would die before printing why.)
+          CFG="$(gh api "repos/$HUB/contents/config.json" --jq .content 2>/dev/null | base64 -d 2>/dev/null)" || CFG=""
           printf '%s' "$CFG" | jq -e '.courses | type == "object"' >/dev/null 2>&1 \
             || { echo "::error::cannot read $HUB/config.json — refusing (the term cannot be proven finished)"; exit 1; }
           STILL="$(printf '%s' "$CFG" | jq -r --arg t "$T" '.courses | to_entries[] | select((.value.semester // "" | ascii_downcase) == $t) | .key' | paste -sd' ' -)"
@@ -61,8 +63,10 @@ jobs:
           # 2. log/ holds this term, and only this term
           FILES=(log/*.json)
           [ "${#FILES[@]}" -gt 0 ] || { echo "::error::log/ is empty — nothing to archive"; exit 1; }
-          OTHER="$(jq -r '.semester // "MISSING" | ascii_downcase' "${FILES[@]}" | sort | uniq -c | awk -v t="$T" '$2 != t' | paste -sd',' -)"
-          MINE="$(jq -r '.semester // "" | ascii_downcase' "${FILES[@]}" | grep -cx "$T")"
+          SEMS="$(jq -r '.semester // "MISSING" | ascii_downcase' "${FILES[@]}")" \
+            || { echo "::error::a log/*.json record is not valid JSON — refusing"; exit 1; }
+          OTHER="$(printf '%s\n' "$SEMS" | sort | uniq -c | awk -v t="$T" '$2 != t' | paste -sd',' -)"
+          MINE="$(printf '%s\n' "$SEMS" | grep -cx "$T")" || MINE=0
           [ "$MINE" -gt 0 ] || { echo "::error::log/ has no record of term $T (found: $OTHER)"; exit 1; }
           [ -z "$OTHER" ] || { echo "::error::log/ also holds other terms ($OTHER) — archive needs log/ to hold only $T"; exit 1; }
 
@@ -104,18 +108,20 @@ jobs:
           # Re-check: log-build may have drained records of the next term since the guard ran.
           FILES=(log/*.json)
           [ "${#FILES[@]}" -gt 0 ] || { echo "::error::log/ is empty — nothing to archive"; exit 1; }
-          OTHER="$(jq -r '.semester // "MISSING" | ascii_downcase' "${FILES[@]}" | sort | uniq -c | awk -v t="$T" '$2 != t' | paste -sd',' -)"
+          SEMS="$(jq -r '.semester // "MISSING" | ascii_downcase' "${FILES[@]}")" \
+            || { echo "::error::a log/*.json record is not valid JSON — nothing moved"; exit 1; }
+          OTHER="$(printf '%s\n' "$SEMS" | sort | uniq -c | awk -v t="$T" '$2 != t' | paste -sd',' -)"
           [ -z "$OTHER" ] || { echo "::error::log/ now also holds other terms ($OTHER) — nothing moved"; exit 1; }
           [ ! -e "$DEST" ] || { echo "::error::$DEST already exists — nothing moved"; exit 1; }
 
+          # Runs under `bash -e`: a failed git mv stops the step before anything is committed.
           mkdir -p "$DEST/log" "$DEST/reports"
           for f in "${FILES[@]}"; do git mv "$f" "$DEST/log/"; done
           for f in reports/*; do
-            [ "$(basename "$f")" = ".gitkeep" ] && continue
-            git mv "$f" "$DEST/reports/"
+            if [ "$(basename "$f")" != ".gitkeep" ]; then git mv "$f" "$DEST/reports/"; fi
           done
           for f in roster.md repo-report.md; do
-            [ -f "$f" ] && git mv "$f" "$DEST/$f"
+            if [ -f "$f" ]; then git mv "$f" "$DEST/$f"; fi
           done
 
           git config user.name "github-actions[bot]"
