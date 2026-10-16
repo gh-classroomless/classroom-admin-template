@@ -109,6 +109,7 @@ jobs:
             echo "- **Actions → \`roster\` → Run workflow → enter a course** — rebuilds that course's roster."
             echo "- **Past terms**: open \`archive/<term>/\` — each finished term's \`repo-report.md\`, \`roster.md\`, \`reports/\` and \`log/\`, frozen by **Actions → \`archive-term\`**."
             echo "- Per-course on purpose: only the course you run is rebuilt (no all-course overhead)."
+            echo "- **Running a term** — add assignments, quiz access codes, end of term: [OPERATE.md](https://github.com/gh-classroomless/.github/blob/main/OPERATE.md)."
             echo ""
             echo "## How to read the status"
             echo "- **Result**: ✅ pass / ❌ fail = the latest push run's autograder conclusion."
