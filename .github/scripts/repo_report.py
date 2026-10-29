@@ -10,11 +10,12 @@ Run from anywhere; it works on the clone it sits in.
 2. Takes that course's current-term records: `log/*.json` plus the pending set.
 3. For each repo: its latest PUSH run (the Action's own query) → ✅ pass / ❌ fail / — no run, and
    the score from the run-log zip, read the way the Action reads it (the last `"totalPoints"` and
-   `"maxPoints"` in the log). A FINISHED run's result is cached by run id in
-   `.git/hub-local/scores.json`; the next report re-reads only repos with a new run.
-4. Writes `local-reports/<course>-repo-report.md`, or `<course>-<CODE>-repo-report.md` with
-   `--assignment` (excluded from git): one table per assignment, `Username | Name | Result | Score
-   | Repo`, last-name order — the Action's detail layout. A row still pending is marked `(pending)`.
+   `"maxPoints"` in the log). A FINISHED run's result is cached by run id in `local/scores.json`;
+   the next report re-reads only repos with a new run.
+4. Writes `local/reports/<course>-repo-report.md`, or `<course>-<CODE>-repo-report.md` with
+   `--assignment` (`local/` is in `.gitignore`): one table per assignment, `Username | Name |
+   Result | Score | Repo`, last-name order — the Action's detail layout. A rerun overwrites the
+   same file. A row still pending is marked `(pending)`.
 
 Writes nothing to GitHub.
 """
@@ -83,7 +84,7 @@ def main():
     ap.add_argument("--course", required=True, help="course key in the log records, e.g. cs122 (case-insensitive)")
     ap.add_argument("--assignment", help="one assignment code only")
     ap.add_argument("--no-log-build", action="store_true", help="skip git pull + the open log: issues")
-    ap.add_argument("--out", help="output file (default: local-reports/<course>[-<CODE>]-repo-report.md)")
+    ap.add_argument("--out", help="output file (default: local/reports/<course>[-<CODE>]-repo-report.md)")
     a = ap.parse_args()
     t0 = time.time()
     clone = hc.CLONE
@@ -131,9 +132,8 @@ def main():
             tag = " (pending)" if src == "pending" else ""
             lines.append(f"| {r['username']} | {r.get('name', '')} | {v['result']} | {v['score']} | "
                          f"[{r['repo']}](https://github.com/{org}/{r['repo']}){tag} |")
-    hc.exclude_local_reports(clone)
     stem = f"{course}-{a.assignment}" if a.assignment else course
-    out = Path(a.out) if a.out else clone / "local-reports" / f"{stem}-repo-report.md"
+    out = Path(a.out) if a.out else hc.local_dir(clone) / "reports" / f"{stem}-repo-report.md"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text("\n".join(lines) + "\n")
     n_pass = sum(v["result"] == "✅ pass" for v in res.values())

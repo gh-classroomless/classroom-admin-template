@@ -3,13 +3,13 @@
 Self-contained: Python's standard library and a GitHub token, nothing else. Clone your
 `<org>/classroom-admin`, and the tools run from that clone on any machine.
 
-The tools READ the clone and the GitHub API. They write only inside the clone's `.git/` and an
-excluded `local-reports/` folder, and never commit, push or close an issue: this repo's Actions
-stay the only writers of `log/`, `reports/`, `roster.md`, `repo-report.md`.
+The tools READ the clone and the GitHub API. They write only into the clone's `local/` folder,
+which the repo's `.gitignore` ignores, and never commit, push or close an issue: this repo's
+Actions stay the only writers of `log/`, `reports/`, `roster.md`, `repo-report.md`.
 
-    .git/hub-local/pending/<repo>.json   log: issues not yet drained by the nightly log-build
-    .git/hub-local/scores.json           {repo: {run_id, result, score}} — a finished run is read once
-    local-reports/<course>[-<CODE>]-repo-report.md
+    local/pending/<repo>.json                  log: issues not yet drained by the nightly log-build
+    local/scores.json                          {repo: {run_id, result, score}} — a finished run is read once
+    local/reports/<course>[-<CODE>]-repo-report.md
 
 Token: `$GH_TOKEN` or `$GITHUB_TOKEN`, else `gh auth token`. It must read this private repo and
 the org's private student repos (a classic PAT with `repo`, or your `gh` login).
@@ -100,7 +100,8 @@ def admin_repo(clone=CLONE):
 
 
 def local_dir(clone=CLONE):
-    d = Path(clone) / ".git" / "hub-local"
+    """`<clone>/local/` — everything these tools write; ignored by the repo's `.gitignore`."""
+    d = Path(clone) / "local"
     d.mkdir(parents=True, exist_ok=True)
     return d
 
@@ -131,12 +132,3 @@ def current_records(clone=CLONE):
             if is_record(rec) and rec["repo"] not in seen:
                 out.append((rec, "pending"))
     return out
-
-
-def exclude_local_reports(clone=CLONE):
-    """Keep `local-reports/` out of `git status` (.git/info/exclude is local and never pushed)."""
-    ex = Path(clone) / ".git" / "info" / "exclude"
-    ex.parent.mkdir(parents=True, exist_ok=True)
-    text = ex.read_text() if ex.exists() else ""
-    if "local-reports/" not in text.split():
-        ex.write_text(text + ("\n" if text and not text.endswith("\n") else "") + "local-reports/\n")

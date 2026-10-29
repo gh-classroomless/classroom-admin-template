@@ -9,7 +9,7 @@ Run from anywhere; it works on the clone it sits in.
 2. Read the OPEN `log:` issues (one per repo `request.yml` provisioned) — repos made since the last
    nightly drain, e.g. in class today.
 3. Validate each body as the Action does (repo, username, course, assignment). A repo already in
-   `log/` is skipped; the rest replace `.git/hub-local/pending/`.
+   `log/` is skipped; the rest replace `local/pending/` (`local/` is in `.gitignore`).
 
 It never commits, pushes or closes an issue — the Action stays the one writer of `log/` and the one
 closer of `log:` issues. `repo_report.py` reads `log/` plus this pending set.
