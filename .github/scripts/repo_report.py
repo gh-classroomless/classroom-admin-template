@@ -1,26 +1,22 @@
 #!/usr/bin/env python3
 """repo_report.py — the read-only local twin of this repo's `repo-report` Action, per course.
 
-    python3 .github/scripts/repo_report.py --course <course> [--assignment <CODE>]
-                                           [--no-log-build] [--out <file.md>]
-
-Run from anywhere; it works on the clone it sits in.
+Run from anywhere; it works on the clone it sits in. Writes nothing to GitHub.
 
 1. Runs `log_build.build()` first (git pull + the open `log:` issues), unless `--no-log-build`.
 2. Takes that course's current-term records: `log/*.json` plus the pending set.
-3. For each repo: its latest PUSH run (the Action's own query) → ✅ pass / ❌ fail / — no run, and
-   the score from the run-log zip, read the way the Action reads it (the last `"totalPoints"` and
-   `"maxPoints"` in the log). A FINISHED run's result is cached by run id in `local/scores.json`;
-   the next report re-reads only repos with a new run.
-4. Writes `local/reports/<course>-repo-report.md`, or `<course>-<CODE>-repo-report.md` with
-   `--assignment` (`local/` is in `.gitignore`): one table per assignment, `Username | Name |
-   Result | Score | Repo`, last-name order — the Action's detail layout. A row still pending is
-   marked `(pending)`.
-5. Writes the same rows as `<same name>.html` beside it — one self-contained page for a browser: a
-   search box (keeps only the rows containing the typed text), green / red results, each repo name
-   a link to the repo on GitHub. A rerun overwrites both files.
-
-Writes nothing to GitHub.
+3. `--results` decides the Result / Score columns, with the Action's own rules:
+     none     (default) no API call; the columns stay empty
+     changed  ask only repos pushed since this course's last check, or never stored; every other
+              repo shows its stored result from `local/scores.json`
+     all      ask every repo; a deleted repo (HTTP 404) is dropped from the tables
+   Asking = the repo's latest PUSH run → ✅ pass / ❌ fail / — no run, and the score from the
+   run-log zip (the last "totalPoints" / "maxPoints"), read only when the run id or attempt
+   changed. A result is stored only when its run is finished AND is the run of the latest push.
+4. Writes `local/reports/<course>[-<CODE>]-repo-report.md` and the same rows as `.html` beside it
+   (search box, green / red results, repo links). One table per assignment, `Username | Name |
+   Result | Score | Repo`, last-name order. A pending row is marked `(pending)`. A rerun
+   overwrites both files.
 """
 from __future__ import annotations
 
@@ -57,24 +53,111 @@ def score_from_zip(blob):
     return f"{tp[-1]}/{mp[-1]}" if tp and mp else "—"
 
 
-def result_of(tok, org, repo, cache):
-    """{run_id, result, score, final} for the repo's latest push run; a finished run from `cache`."""
+CUTOFF_MARGIN = 1800      # a course's cutoff = its last check minus 30 min (a run created late)
+
+
+def epoch(iso):
+    return datetime.fromisoformat((iso or "1970-01-01T00:00:00Z").replace("Z", "+00:00")).timestamp()
+
+
+def label(conclusion):
+    return {"success": "✅ pass", "failure": "❌ fail"}.get(conclusion, f"… {conclusion}")
+
+
+def load_store(path):
+    """{checked_at: {course: iso}, repos: {repo: {run_id, run_attempt, created_at, result, score}}}"""
+    try:
+        s = json.loads(path.read_text())
+    except (OSError, ValueError):
+        s = None
+    return s if isinstance(s, dict) and "repos" in s and "checked_at" in s else {"checked_at": {}, "repos": {}}
+
+
+def org_pushed_since(tok, org, cutoff):
+    """{repo: pushed_at epoch} for the org's repos pushed at/after `cutoff`, newest first, 100 a page."""
+    status, data, _ = hc._request(f"{hc.API}/orgs/{org}/repos?type=private&per_page=1", tok)
+    if not data:   # a token that cannot see private repos would list none and miss every push
+        raise SystemExit(f"the token cannot list {org}'s private repos (HTTP {status}) — --results changed cannot run")
+    pushed, page = {}, 1
+    while True:
+        status, data, _ = hc._request(f"{hc.API}/orgs/{org}/repos?sort=pushed&direction=desc"
+                                      f"&per_page=100&page={page}", tok)
+        if data is None:
+            raise SystemExit(f"could not list {org}'s repos (page {page}, HTTP {status})")
+        if not data:
+            return pushed
+        for r in data:
+            pushed[r["name"]] = epoch(r.get("pushed_at"))
+        if epoch(data[-1].get("pushed_at")) < cutoff:
+            return pushed
+        page += 1
+
+
+def ask(tok, org, repo, stored):
+    """The repo's latest push run: {kind: ok|norun|gone|err, …}. The log zip is read only when the
+    run id or attempt differs from `stored`."""
     status, runs, _ = hc._request(f"{hc.API}/repos/{org}/{repo}/actions/runs?event=push&per_page=1", tok)
-    if status == 404:       # the repo was deleted (or the token cannot see it)
-        return {"run_id": None, "result": "⛔ repo not found", "score": "—"}
+    if status == 404:
+        return {"kind": "gone"}
     if runs is None:
-        return {"run_id": None, "result": f"⚠ unreadable (HTTP {status})", "score": "—"}
+        return {"kind": "err", "status": status}
     run = (runs.get("workflow_runs") or [None])[0]
     if not run:
-        return {"run_id": None, "result": "— no run", "score": "—"}
-    rid, concl = run["id"], run.get("conclusion")
-    hit = cache.get(repo)
-    if concl and hit and hit.get("run_id") == rid:
-        return hit
-    result = {"success": "✅ pass", "failure": "❌ fail"}.get(concl, f"… {concl or run.get('status')}")
-    blob = hc.get_bytes(tok, f"/repos/{org}/{repo}/actions/runs/{rid}/logs")
-    return {"run_id": rid, "result": result, "score": score_from_zip(blob) if blob else "—",
-            "final": bool(concl)}
+        return {"kind": "norun"}
+    a = {"kind": "ok", "run_id": run["id"], "run_attempt": run.get("run_attempt"),
+         "created_at": run.get("created_at"), "conclusion": run.get("conclusion"), "score": "—"}
+    if a["conclusion"]:
+        if stored and stored.get("run_id") == a["run_id"] and stored.get("run_attempt") == a["run_attempt"]:
+            a["score"] = stored.get("score", "—")
+        else:
+            blob = hc.get_bytes(tok, f"/repos/{org}/{repo}/actions/runs/{a['run_id']}/logs")
+            a["score"] = score_from_zip(blob) if blob else "—"
+    return a
+
+
+def results_for(mode, tok, org, course, scope, store, update_course):
+    """{repo: (result, score, drop)} for `scope`, and `store` updated in place — the Action's rules."""
+    pushed, cut = {}, 0
+    if mode == "all":
+        to_ask = list(scope)
+    else:
+        last = store["checked_at"].get(course)
+        cut = epoch(last) - CUTOFF_MARGIN if last else 0
+        if cut > 0:
+            pushed = org_pushed_since(tok, org, cut)
+        to_ask = [r for r in scope if r not in store["repos"] or cut == 0 or pushed.get(r, 0) >= cut]
+    print(f"results={mode}: asking {len(to_ask)} of {len(scope)} repos")
+    with cf.ThreadPoolExecutor(max_workers=WORKERS) as ex:
+        answers = dict(zip(to_ask, ex.map(lambda r: ask(tok, org, r, store["repos"].get(r)), to_ask)))
+    for repo, a in answers.items():
+        if a["kind"] in ("gone", "err"):
+            store["repos"].pop(repo, None)
+        elif a["kind"] == "norun":
+            store["repos"][repo] = {"run_id": None, "run_attempt": None, "result": "— no run", "score": "—"}
+        elif not a["conclusion"] or pushed.get(repo, 0) > epoch(a["created_at"]):
+            store["repos"].pop(repo, None)       # unfinished, or not the latest push's run: ask again
+        else:
+            store["repos"][repo] = {"run_id": a["run_id"], "run_attempt": a["run_attempt"],
+                                    "created_at": a["created_at"], "result": label(a["conclusion"]),
+                                    "score": a["score"]}
+    if update_course:
+        store["checked_at"][course] = datetime.now(ZoneInfo("UTC")).strftime("%Y-%m-%dT%H:%M:%SZ")
+    out = {}
+    for repo in scope:
+        a, s = answers.get(repo), store["repos"].get(repo)
+        if a and a["kind"] == "gone":
+            out[repo] = ("", "", True)
+        elif a and a["kind"] == "err":
+            out[repo] = (f"⚠ unreadable (HTTP {a['status']})", "—", False)
+        elif a and a["kind"] == "ok" and not a["conclusion"]:
+            out[repo] = ("… in progress", "—", False)
+        elif a and a["kind"] == "ok" and pushed.get(repo, 0) > epoch(a["created_at"]):
+            out[repo] = ("… new push, run not started", "—", False)
+        elif s:
+            out[repo] = (s["result"], s["score"], False)
+        else:
+            out[repo] = ("", "", False)
+    return out
 
 
 def last_name_key(name):
@@ -82,12 +165,31 @@ def last_name_key(name):
     return ((parts[-1] if parts else "").lower(), (name or "").lower())
 
 
+class _Help(argparse.RawDescriptionHelpFormatter):
+    pass
+
+
+EXAMPLES = """examples:
+  python3 .github/scripts/repo_report.py --course cs122                        # repo list only, no API
+  python3 .github/scripts/repo_report.py --course cs122 --results changed      # re-check pushed repos
+  python3 .github/scripts/repo_report.py --course cs122 --results all          # re-check every repo
+  python3 .github/scripts/repo_report.py --course cs122 --assignment W25 --results all
+
+output: local/reports/<course>[-<CODE>]-repo-report.md + .html (open the .html in a browser)"""
+
+
 def main():
-    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--course", required=True, help="course key in the log records, e.g. cs122 (case-insensitive)")
-    ap.add_argument("--assignment", help="one assignment code only")
-    ap.add_argument("--no-log-build", action="store_true", help="skip git pull + the open log: issues")
-    ap.add_argument("--out", help="output file (default: local/reports/<course>[-<CODE>]-repo-report.md)")
+    ap = argparse.ArgumentParser(description=__doc__, epilog=EXAMPLES, formatter_class=_Help)
+    ap.add_argument("--course", required=True, help="REQUIRED. Course key in the log records, e.g. cs122 "
+                                                    "(case-insensitive)")
+    ap.add_argument("--assignment", default=None, help="one assignment code only (default: every assignment)")
+    ap.add_argument("--results", choices=["none", "changed", "all"], default="none",
+                    help="fill Result / Score: none = no API · changed = repos pushed since the last check · "
+                         "all = every repo (default: none)")
+    ap.add_argument("--no-log-build", action="store_true", help="skip git pull + reading the open log: issues "
+                                                                "(default: do both first)")
+    ap.add_argument("--out", default=None, help="the .md file (default: local/reports/<course>[-<CODE>]-repo-report.md;"
+                                                " the .html goes beside it)")
     a = ap.parse_args()
     t0 = time.time()
     clone = hc.CLONE
@@ -105,24 +207,25 @@ def main():
         raise SystemExit(f"no current-term record for course={course}"
                          f"{' assignment=' + a.assignment if a.assignment else ''}. Courses: {courses}")
 
-    cache_file = hc.local_dir(clone) / "scores.json"
-    cache = json.loads(cache_file.read_text()) if cache_file.exists() else {}
-    tok = hc.token()
-    with cf.ThreadPoolExecutor(max_workers=WORKERS) as ex:
-        res = dict(zip([r["repo"] for r, _ in recs],
-                       ex.map(lambda rs: result_of(tok, org, rs[0]["repo"], cache), recs)))
-    for repo, v in res.items():
-        if v.get("final"):
-            cache[repo] = v
-    cache_file.write_text(json.dumps(cache, indent=0, sort_keys=True))
+    scope = [r["repo"] for r, _ in recs]
+    if a.results == "none":
+        shown = {repo: ("", "", False) for repo in scope}
+    else:
+        store_file = hc.local_dir(clone) / "scores.json"
+        store = load_store(store_file)
+        # one assignment does not check the whole course, so the course's checked_at stays
+        shown = results_for(a.results, hc.token(), org, course, scope, store, update_course=not a.assignment)
+        store_file.write_text(json.dumps(store, indent=0, sort_keys=True))
+    recs = [(r, s) for r, s in recs if not shown[r["repo"]][2]]
+    res = {repo: {"result": v[0], "score": v[1]} for repo, v in shown.items()}
 
     stamp = datetime.now(PT).strftime("%Y-%m-%d %I:%M %p %Z")
     by_asmt = {}
     for r, src in recs:
         by_asmt.setdefault(r["assignment"], []).append((r, src))
     lines = [f"# {course}{' / ' + a.assignment if a.assignment else ''} — repo report (local)", "",
-             f"_Generated {stamp} from `{org}/classroom-admin` log/ + open log: issues · "
-             f"{len(recs)} repos · {time.time() - t0:.1f}s_", "",
+             f"_Generated {stamp} (results={a.results}) from `{org}/classroom-admin` log/ + open log: "
+             f"issues · {len(recs)} repos · {time.time() - t0:.1f}s_", "",
              "| Assignment | Repos | Pass |", "|---|---|---|"]
     for asmt in sorted(by_asmt):
         rows = by_asmt[asmt]
@@ -140,7 +243,7 @@ def main():
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text("\n".join(lines) + "\n")
     out_html = out.with_suffix(".html")
-    out_html.write_text(render_html(lines[0][2:], f"Generated {stamp} from {org}/classroom-admin log/ + "
+    out_html.write_text(render_html(lines[0][2:], f"Generated {stamp} (results={a.results}) from {org}/classroom-admin log/ + "
                                     f"open log: issues · {len(recs)} repos · {time.time() - t0:.1f}s",
                                     by_asmt, res, org))
     n_pass = sum(v["result"] == "✅ pass" for v in res.values())

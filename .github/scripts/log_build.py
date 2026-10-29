@@ -65,8 +65,10 @@ def build(clone=hc.CLONE, pull=True, quiet=False):
 
 
 def main():
-    ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--no-pull", action="store_true", help="skip git pull")
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 epilog="example:\n  python3 .github/scripts/log_build.py\n\n"
+                                        "output: local/pending/<repo>.json (read by repo_report.py)")
+    ap.add_argument("--no-pull", action="store_true", help="skip git pull (default: pull first)")
     a = ap.parse_args()
     t0 = time.time()
     n = build(pull=not a.no_pull)

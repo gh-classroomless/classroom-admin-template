@@ -1,27 +1,41 @@
 name: repo-report
 
-# Manual, PER-COURSE refresh. Instructor: Actions -> repo-report -> Run workflow -> enter `course`
-# (e.g. cs120; case-insensitive). Rebuilds ONLY that course's per-assignment detail files (with
-# autograder pass/fail + score) + the index repo-report.md + README.md. PRIVATE admin repo.
-# Reading OTHER repos' Actions needs ORG_REPO_TOKEN (a PAT with org actions:read) — the default
-# GITHUB_TOKEN is scoped to THIS repo only and cannot read student repos' runs.
+# Builds the index repo-report.md + README.md and, for the chosen course (blank = all), one
+# reports/<course>-<assignment>.md per assignment: Username | Name | Result | Score | Repo, from
+# log/*.json. PRIVATE admin repo.
+#
+# `results` decides whether the Result / Score columns are filled (they need the GitHub API):
+#   none     no API call. The columns stay empty (5 columns kept: the grade engine reads the repo
+#            link from the 5th). The nightly run uses this.
+#   changed  ask only repos pushed since this course's last check (or never checked); every other
+#            repo keeps its stored result from reports/.scores.json
+#   all      ask every repo; a repo GitHub answers 404 for (deleted) is dropped from the tables
+# Reading OTHER repos needs ORG_REPO_TOKEN (a PAT that can read the org's private repos and their
+# Actions) — the default GITHUB_TOKEN is scoped to THIS repo only.
 on:
-  # Scheduled off-hours: a full repo-report costs ~1,340 REST calls of the
-  # shared token's 5,000/hr, so it must not compete with student repo requests.
   schedule:
-    - cron: "20 12 * * *"  # 05:20 America/Los_Angeles (PDT) — after log-build wrote log/*.json
+    - cron: "20 12 * * *"  # 05:20 America/Los_Angeles (PDT) — after log-build wrote log/*.json; results=none
   workflow_dispatch:
     inputs:
       course:
-        description: "Course to rebuild (e.g. cs120; case-insensitive). Blank = ALL courses (slow)."
+        description: "Course to rebuild (e.g. cs120; case-insensitive). Blank = ALL courses."
         required: false
         default: ""
+      results:
+        description: "Fill Result / Score? none = list only (no API) · changed = repos pushed since the last check · all = every repo"
+        type: choice
+        options: [none, changed, all]
+        default: none
   workflow_call:   # archive-term calls it for the final snapshot before freezing a term
     inputs:
       course:
         type: string
         required: false
         default: ""
+      results:
+        type: string
+        required: false
+        default: none
     secrets:
       ORG_REPO_TOKEN:
         required: false
@@ -45,21 +59,24 @@ jobs:
       ORG: ${{ github.repository_owner }}
       GH_TOKEN: ${{ secrets.ORG_REPO_TOKEN }}   # cross-repo actions:read for `gh api`
       ONLY: ${{ inputs.course }}
+      RESULTS: ${{ inputs.results || 'none' }}  # the schedule has no inputs → none
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.repository.default_branch || 'main' }}   # tip, not the triggering sha (archive-term calls this after other commits)
 
-      - name: Build repo-report (index + per course/assignment detail with pass/fail + score)
+      - name: Build repo-report (index + per course/assignment detail; Result/Score per `results`)
         run: |
           set -uo pipefail
           STAMP="$(TZ='America/Los_Angeles' date '+%Y-%m-%d %I:%M %p %Z')"
+          NOW="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
           mkdir -p reports
           # The current term is whatever is in top-level log/. A finished term was moved to
           # archive/<term>/ by archive-term, together with the pages built from it.
-          SRC="log"; IDXFILE="repo-report.md"
+          SRC="log"; IDXFILE="repo-report.md"; STORE="reports/.scores.json"
           HAVE="$(find ${SRC} -maxdepth 1 -name '*.json' 2>/dev/null | wc -l | tr -d ' ')"
           TAB="$(printf '\t')"
+          case "${RESULTS}" in none|changed|all) ;; *) echo "::error::results must be none, changed or all (got '${RESULTS}')"; exit 1 ;; esac
           # course matching is CASE-INSENSITIVE: normalize the input + every course to lowercase
           # (so `COMSC240` and `comsc240` are one course).
           ONLY="$(printf '%s' "${ONLY:-}" | tr '[:upper:]' '[:lower:]')"
@@ -88,7 +105,7 @@ jobs:
           {
             echo "# Submission Report — Index"
             echo ""
-            echo "_Generated ${STAMP} — refresh: Actions -> repo-report -> Run workflow (enter a course). Total repos: **${HAVE}**._"
+            echo "_Generated ${STAMP} (results=${RESULTS}) — refresh: Actions -> repo-report -> Run workflow. Total repos: **${HAVE}**._"
             cat /tmp/idx_body.md
           } > "${IDXFILE}"
 
@@ -100,12 +117,14 @@ jobs:
             echo "> ⛔ **PRIVATE — never make this repo public.** It stores PII: \`roster/<username>.json\` (student name / email / registered) and \`log/<repo>.json\` (per-repo provisioning records). Written by the \`${ORG}/classroom\` workflows via \`ORG_PAT\`."
             echo ""
             echo "## What's here"
-            echo "- **This page** = live submission status per course (autograder **pass/fail + score**). Click **open** for a per-assignment detail."
+            echo "- **This page** = the repos per course and assignment. Click **open** for a per-assignment detail (who, which repo, and — when filled — pass/fail + score)."
             echo "- [\`roster.md\`](roster.md) — student roster per course; each name links to that student's repo list."
             echo "- \`reports/\` — generated detail pages · \`log/\`, \`roster/\` — raw PII data (do not share)."
             echo ""
             echo "## Refresh (manual, per course)"
-            echo "- **Actions → \`repo-report\` → Run workflow → enter a course** (e.g. \`cs120\`; case-insensitive) — rebuilds THAT course's pass/fail + score."
+            echo "- The nightly run lists the repos only (\`results\` = none, no API cost): Result / Score are empty."
+            echo "- **Actions → \`repo-report\` → Run workflow → course + \`results\`**: \`changed\` re-checks only repos pushed since the last check (fast), \`all\` re-checks every repo and drops deleted ones."
+            echo "- **On your machine, in seconds:** \`python3 .github/scripts/repo_report.py --course <c> --results changed\` from a clone (see OPERATE.md)."
             echo "- **Actions → \`roster\` → Run workflow → enter a course** — rebuilds that course's roster."
             echo "- **Past terms**: open \`archive/<term>/\` — each finished term's \`repo-report.md\`, \`roster.md\`, \`reports/\` and \`log/\`, frozen by **Actions → \`archive-term\`**."
             echo "- Per-course on purpose: only the course you run is rebuilt (no all-course overhead)."
@@ -114,6 +133,7 @@ jobs:
             echo "## How to read the status"
             echo "- **Result**: ✅ pass / ❌ fail = the latest push run's autograder conclusion."
             echo "- **Score**: autograder \`totalPoints/maxPoints\` parsed from the run log."
+            echo "- **Empty** Result / Score: this run did not fill them (\`results\` = none)."
             echo ""
             echo "_Status generated ${STAMP} · total repos: **${HAVE}**._"
             echo ""
@@ -122,60 +142,144 @@ jobs:
             cat /tmp/idx_body.md
           } > README.md
 
-          # ---- autograder result for one repo -> prints "PF<TAB>SCORE" ----
-          autograder_result () {
-            repo="$1"; runs=""; runid=""; concl=""; pf=""; score="—"; tp=""; mp=""
-            runs="$(gh api "/repos/${ORG}/${repo}/actions/runs?event=push&per_page=1" 2>/dev/null || echo '{}')"
-            concl="$(printf '%s' "$runs" | jq -r '.workflow_runs[0].conclusion // "none"')"
-            runid="$(printf '%s' "$runs" | jq -r '.workflow_runs[0].id // empty')"
-            case "$concl" in
-              success) pf="✅ pass";;
-              failure) pf="❌ fail";;
-              none)    pf="— no run";;
-              *)       pf="… ${concl}";;
-            esac
-            if [ -n "$runid" ]; then
-              z="$(mktemp)"                              # unique per call -> parallel-safe
-              if gh api "/repos/${ORG}/${repo}/actions/runs/${runid}/logs" > "$z" 2>/dev/null && [ -s "$z" ]; then
-                L="$(unzip -p "$z" 2>/dev/null)"         # decompress once
-                tp="$(printf '%s' "$L" | grep -oE '"totalPoints": *[0-9]+' | tail -1 | grep -oE '[0-9]+' || true)"
-                mp="$(printf '%s' "$L" | grep -oE '"maxPoints": *[0-9]+'   | tail -1 | grep -oE '[0-9]+' || true)"
-                [ -n "$tp" ] && [ -n "$mp" ] && score="${tp}/${mp}"
-              fi
-              rm -f "$z"
-            fi
-            printf '%s\t%s' "$pf" "$score"
-          }
+          # ---- scope: the repos whose detail tables this run writes (course \t repo) ----
+          : > /tmp/scope.tsv
+          if [ "$HAVE" -gt 0 ]; then
+            jq -r '"\(.course|ascii_downcase)\t\(.repo)"' ${SRC}/*.json | sort -u \
+              | awk -F"$TAB" -v only="${ONLY}" 'only == "" || $1 == only' > /tmp/scope.tsv
+          fi
+          cut -f1 /tmp/scope.tsv | sort -u > /tmp/scope_courses.txt
 
-          # build one markdown row, preserving sort index (for parallel reassembly)
-          build_row () {
-            IFS="$TAB" read -r idx username name repo <<< "$1"
-            [ -n "$repo" ] || return 0
-            res="$(autograder_result "$repo")"; pf="${res%%${TAB}*}"; score="${res##*${TAB}}"
-            printf '%s\t| %s | %s | %s | %s | [%s](https://github.com/%s/%s) |\n' \
-              "$idx" "$username" "$name" "$pf" "$score" "$repo" "$ORG" "$repo"
-          }
-          export -f autograder_result build_row; export ORG TAB
+          # ---- Result / Score: repo \t result \t score (\t DROP for a deleted repo) ----
+          : > /tmp/res.tsv
+          if [ "${RESULTS}" != none ] && [ -s /tmp/scope.tsv ]; then
+            jq -e '.repos and .checked_at' "$STORE" >/dev/null 2>&1 || echo '{"checked_at":{},"repos":{}}' > "$STORE"
+            jq -r '.repos | keys[]' "$STORE" > /tmp/stored.txt
+            : > /tmp/pushed.tsv            # repo \t pushed_at (epoch), the repos pushed since a cutoff
+            if [ "${RESULTS}" = all ]; then
+              cut -f2 /tmp/scope.tsv > /tmp/ask.txt
+            else
+              # cutoff per course = its last check minus 30 min; a course never checked = 0 (ask all)
+              while read -r c; do
+                printf '%s\t%s\n' "$c" "$(jq -r --arg c "$c" '(.checked_at[$c] // "") | if . == "" then 0 else (fromdateiso8601 - 1800) end' "$STORE")"
+              done < /tmp/scope_courses.txt > /tmp/cut.tsv
+              MINCUT="$(awk -F"$TAB" '$2 > 0 && (m == "" || $2 < m) {m = $2} END {print m + 0}' /tmp/cut.tsv)"
+              if [ "$MINCUT" -gt 0 ]; then
+                # a token that cannot see private repos would list none and miss every push: refuse
+                [ "$(gh api "/orgs/${ORG}/repos?type=private&per_page=1" --jq 'length' 2>/dev/null || echo 0)" -gt 0 ] \
+                  || { echo "::error::ORG_REPO_TOKEN cannot list ${ORG}'s private repos — results=changed cannot run"; exit 1; }
+                p=1
+                while :; do
+                  page="$(gh api "/orgs/${ORG}/repos?sort=pushed&direction=desc&per_page=100&page=${p}" \
+                          --jq '.[] | "\(.name)\t\((.pushed_at // "1970-01-01T00:00:00Z") | fromdateiso8601)"')" \
+                    || { echo "::error::could not list ${ORG}'s repos (page ${p})"; exit 1; }
+                  [ -n "$page" ] || break
+                  printf '%s\n' "$page" >> /tmp/pushed.tsv
+                  [ "$(printf '%s\n' "$page" | tail -1 | cut -f2)" -lt "$MINCUT" ] && break
+                  p=$((p + 1))
+                done
+                echo "org repos read for pushes: $(wc -l < /tmp/pushed.tsv) (${p} page(s))"
+              fi
+              # ask: never stored, a course never checked, or pushed at/after its course's cutoff
+              awk -F"$TAB" 'FILENAME == ARGV[1] {cut[$1] = $2; next}
+                            FILENAME == ARGV[2] {st[$1] = 1; next}
+                            FILENAME == ARGV[3] {pu[$1] = $2; next}
+                            { if (!($2 in st) || cut[$1] + 0 == 0 || (($2 in pu) && pu[$2] >= cut[$1])) print $2 }' \
+                  /tmp/cut.tsv /tmp/stored.txt /tmp/pushed.tsv /tmp/scope.tsv > /tmp/ask.txt
+            fi
+            echo "results=${RESULTS}: asking $(wc -l < /tmp/ask.txt) of $(wc -l < /tmp/scope.tsv) repos"
+
+            # one repo -> repo \t kind \t run_id \t run_attempt \t created_at \t conclusion \t score
+            #   kind: ok · norun · gone (HTTP 404) · err. The log zip is read only for a run whose
+            #   id or attempt differs from the stored one.
+            ask_repo () {
+              repo="$1"; e="$(mktemp)"
+              out="$(gh api "/repos/${ORG}/${repo}/actions/runs?event=push&per_page=1" \
+                     --jq '(.workflow_runs[0] // {}) | [(.id // ""), (.run_attempt // ""), (.created_at // ""), (.conclusion // "")] | @tsv' 2>"$e")"
+              rc=$?
+              if [ $rc -ne 0 ]; then
+                if grep -q 'HTTP 404' "$e"; then printf '%s\tgone\n' "$repo"; else printf '%s\terr\n' "$repo"; fi
+                rm -f "$e"; return 0
+              fi
+              rm -f "$e"
+              IFS="$TAB" read -r id att created concl <<< "$out"
+              if [ -z "$id" ]; then printf '%s\tnorun\n' "$repo"; return 0; fi
+              score="—"
+              if [ -n "$concl" ]; then
+                old="$(jq -r --arg r "$repo" '.repos[$r] // {} | "\(.run_id // "")\t\(.run_attempt // "")\t\(.score // "")"' "$STORE")"
+                if [ "$(printf '%s' "$old" | cut -f1)" = "$id" ] && [ "$(printf '%s' "$old" | cut -f2)" = "$att" ]; then
+                  score="$(printf '%s' "$old" | cut -f3)"
+                else
+                  z="$(mktemp)"
+                  if gh api "/repos/${ORG}/${repo}/actions/runs/${id}/logs" > "$z" 2>/dev/null && [ -s "$z" ]; then
+                    L="$(unzip -p "$z" 2>/dev/null)"
+                    tp="$(printf '%s' "$L" | grep -oE '"totalPoints": *[0-9]+' | tail -1 | grep -oE '[0-9]+' || true)"
+                    mp="$(printf '%s' "$L" | grep -oE '"maxPoints": *[0-9]+'   | tail -1 | grep -oE '[0-9]+' || true)"
+                    [ -n "$tp" ] && [ -n "$mp" ] && score="${tp}/${mp}"
+                  fi
+                  rm -f "$z"
+                fi
+              fi
+              printf '%s\tok\t%s\t%s\t%s\t%s\t%s\n' "$repo" "$id" "$att" "$created" "$concl" "$score"
+            }
+            export -f ask_repo; export ORG TAB STORE
+            : > /tmp/q.tsv
+            [ -s /tmp/ask.txt ] && xargs -d '\n' -P 32 -n1 bash -c 'ask_repo "$1"' _ < /tmp/ask.txt > /tmp/q.tsv
+
+            # merge into the store. A result is stored only when its run is FINISHED and is the run
+            # of the latest push (created at/after pushed_at); otherwise the repo is left unstored
+            # and asked again next time. Deleted (404) and unreadable repos leave the store too.
+            jq -n --rawfile q /tmp/q.tsv --rawfile pu /tmp/pushed.tsv --rawfile cs /tmp/scope_courses.txt \
+                  --slurpfile st "$STORE" --arg now "$NOW" '
+              def rows($s): $s | split("\n") | map(select(length > 0) | split("\t"));
+              def label($c): if $c == "success" then "✅ pass" elif $c == "failure" then "❌ fail" else "… " + $c end;
+              (rows($pu) | map({(.[0]): (.[1] | tonumber)}) | add // {}) as $P
+              | reduce rows($q)[] as $r ($st[0];
+                  if   ($r[1] == "gone" or $r[1] == "err") then .repos |= del(.[$r[0]])
+                  elif $r[1] == "norun" then .repos[$r[0]] = {run_id: null, run_attempt: null, result: "— no run", score: "—"}
+                  elif $r[5] == "" then .repos |= del(.[$r[0]])
+                  elif (($P[$r[0]] // 0) > ($r[4] | fromdateiso8601)) then .repos |= del(.[$r[0]])
+                  else .repos[$r[0]] = {run_id: ($r[2] | tonumber), run_attempt: ($r[3] | tonumber),
+                                        created_at: $r[4], result: label($r[5]), score: $r[6]}
+                  end)
+              | reduce rows($cs)[] as $c (.; .checked_at[$c[0]] = $now)' > /tmp/store.new && mv /tmp/store.new "$STORE"
+
+            # what each in-scope repo shows: this run's answer first, else the stored result
+            jq -rn --rawfile q /tmp/q.tsv --rawfile pu /tmp/pushed.tsv --rawfile sc /tmp/scope.tsv \
+                   --slurpfile st "$STORE" '
+              def rows($s): $s | split("\n") | map(select(length > 0) | split("\t"));
+              (rows($pu) | map({(.[0]): (.[1] | tonumber)}) | add // {}) as $P
+              | (rows($q) | map({(.[0]): .}) | add // {}) as $Q
+              | rows($sc)[] | .[1] as $r | ($Q[$r] // null) as $a | ($st[0].repos[$r] // null) as $s
+              | if   $a != null and $a[1] == "gone" then [$r, "", "", "DROP"]
+                elif $a != null and $a[1] == "err"  then [$r, "⚠ unreadable", "—", ""]
+                elif $a != null and $a[1] == "ok" and $a[5] == "" then [$r, "… in progress", "—", ""]
+                elif $a != null and $a[1] == "ok" and (($P[$r] // 0) > ($a[4] | fromdateiso8601))
+                                                     then [$r, "… new push, run not started", "—", ""]
+                elif $s != null then [$r, $s.result, $s.score, ""]
+                else [$r, "", "", ""] end
+              | @tsv' > /tmp/res.tsv
+          fi
 
           # ---- per course/assignment detail — ONLY the chosen course (blank = all) ----
           if [ "$HAVE" -gt 0 ]; then
             jq -r '"\(.course|ascii_downcase)\t\(.assignment)"' ${SRC}/*.json | sort -u | while IFS="$TAB" read -r course assign; do
               [ -n "$course" ] || continue
               if [ -n "${ONLY}" ] && [ "${ONLY}" != "${course}" ]; then continue; fi
-              echo "building ${course}/${assign} ..."
               {
                 echo "# ${course} / ${assign}"
                 echo ""
-                echo "_Generated ${STAMP}_ · [← index](../${IDXFILE})"
+                echo "_Generated ${STAMP} (results=${RESULTS})_ · [← index](../${IDXFILE})"
                 echo ""
                 echo "| Username | Name | Result | Score | Repo |"
                 echo "|---|---|---|---|---|"
                 jq -r --arg c "$course" --arg a "$assign" '
                   select((.course|ascii_downcase)==$c and .assignment==$a) | "\(.username)\t\(.name)\t\(.repo)"' ${SRC}/*.json \
                   | awk -F"$TAB" '{n=split($2,a," "); print tolower(a[n]) "\t" $0}' | sort -f | cut -f2- \
-                  | awk -F"$TAB" '{print NR"\t"$0}' \
-                  | xargs -d '\n' -P 32 -n1 bash -c 'build_row "$1"' _ \
-                  | sort -t"$TAB" -k1,1n | cut -f2-
+                  | awk -F"$TAB" -v org="$ORG" 'FILENAME == ARGV[1] {res[$1] = $2; sc[$1] = $3; drop[$1] = ($4 == "DROP"); next}
+                      { if (drop[$3]) next
+                        printf "| %s | %s | %s | %s | [%s](https://github.com/%s/%s) |\n", $1, $2, res[$3], sc[$3], $3, org, $3 }' \
+                      /tmp/res.tsv -
               } > "reports/${course}-${assign}.md"
             done
           fi
