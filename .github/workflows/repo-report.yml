@@ -6,15 +6,17 @@ name: repo-report
 #
 # `results` decides whether the Result / Score columns are filled (they need the GitHub API):
 #   none     no API call. The columns stay empty (5 columns kept: the grade engine reads the repo
-#            link from the 5th). The nightly run uses this.
+#            link from the 5th). The default of a manual run, and what archive-term uses.
 #   changed  ask only repos pushed since this course's last check (or never checked); every other
-#            repo keeps its stored result from reports/.scores.json
-#   all      ask every repo; a repo GitHub answers 404 for (deleted) is dropped from the tables
+#            repo keeps its stored result from reports/.scores.json. The nightly run uses this.
+#   all      ask every repo; a repo GitHub answers 404 for (deleted) is dropped from the tables.
+#            Not used in normal operation: it costs ~2 calls per repo, and what only it catches (a
+#            deleted repo, a re-run without a push) does not affect grading.
 # Reading OTHER repos needs ORG_REPO_TOKEN (a PAT that can read the org's private repos and their
 # Actions) — the default GITHUB_TOKEN is scoped to THIS repo only.
 on:
   schedule:
-    - cron: "20 12 * * *"  # 05:20 America/Los_Angeles (PDT) — after log-build wrote log/*.json; results=none
+    - cron: "20 12 * * *"  # 05:20 America/Los_Angeles (PDT) — after log-build wrote log/*.json; results=changed
   workflow_dispatch:
     inputs:
       course:
@@ -22,7 +24,7 @@ on:
         required: false
         default: ""
       results:
-        description: "Fill Result / Score? none = list only (no API) · changed = repos pushed since the last check · all = every repo"
+        description: "Fill Result / Score? none = list only (no API) · changed = repos pushed since the last check · all = every repo (not for normal use)"
         type: choice
         options: [none, changed, all]
         default: none
@@ -59,7 +61,7 @@ jobs:
       ORG: ${{ github.repository_owner }}
       GH_TOKEN: ${{ secrets.ORG_REPO_TOKEN }}   # cross-repo actions:read for `gh api`
       ONLY: ${{ inputs.course }}
-      RESULTS: ${{ inputs.results || 'none' }}  # the schedule has no inputs → none
+      RESULTS: ${{ inputs.results || 'changed' }}  # the schedule has no inputs → changed; a manual run / archive-term → their own value (default none)
     steps:
       - uses: actions/checkout@v4
         with:
@@ -122,8 +124,8 @@ jobs:
             echo "- \`reports/\` — generated detail pages · \`log/\`, \`roster/\` — raw PII data (do not share)."
             echo ""
             echo "## Refresh (manual, per course)"
-            echo "- The nightly run lists the repos only (\`results\` = none, no API cost): Result / Score are empty."
-            echo "- **Actions → \`repo-report\` → Run workflow → course + \`results\`**: \`changed\` re-checks only repos pushed since the last check (fast), \`all\` re-checks every repo and drops deleted ones."
+            echo "- The nightly run (05:20 PT) uses \`results\` = changed: only repos pushed since the last check are re-checked; the rest keep their stored result."
+            echo "- **Actions → \`repo-report\` → Run workflow → course + \`results\`**: \`none\` = the list only (no API), \`changed\` = re-check pushed repos. \`all\` (re-check every repo) is not for normal use."
             echo "- **On your machine, in seconds:** \`python3 .github/scripts/repo_report.py --course <c> --results changed\` from a clone (see OPERATE.md)."
             echo "- **Actions → \`roster\` → Run workflow → enter a course** — rebuilds that course's roster."
             echo "- **Past terms**: open \`archive/<term>/\` — each finished term's \`repo-report.md\`, \`roster.md\`, \`reports/\` and \`log/\`, frozen by **Actions → \`archive-term\`**."
@@ -133,7 +135,7 @@ jobs:
             echo "## How to read the status"
             echo "- **Result**: ✅ pass / ❌ fail = the latest push run's autograder conclusion."
             echo "- **Score**: autograder \`totalPoints/maxPoints\` parsed from the run log."
-            echo "- **Empty** Result / Score: this run did not fill them (\`results\` = none)."
+            echo "- **Empty** Result / Score: the last run that wrote this table used \`results\` = none."
             echo ""
             echo "_Status generated ${STAMP} · total repos: **${HAVE}**._"
             echo ""

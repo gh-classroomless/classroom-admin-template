@@ -86,9 +86,7 @@ jobs:
 
   repo-report:
     needs: roster
-    uses: ./.github/workflows/repo-report.yml
-    with:
-      results: all   # the frozen term keeps every repo's final result and score
+    uses: ./.github/workflows/repo-report.yml   # results = none: the frozen term keeps the repo list
     secrets: inherit
 
   archive:
