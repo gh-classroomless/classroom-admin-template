@@ -232,7 +232,7 @@ jobs:
             jq -n --rawfile q /tmp/q.tsv --rawfile pu /tmp/pushed.tsv --rawfile cs /tmp/scope_courses.txt \
                   --slurpfile st "$STORE" --arg now "$NOW" '
               def rows($s): $s | split("\n") | map(select(length > 0) | split("\t"));
-              def label($c): if $c == "success" then "✅ pass" elif $c == "failure" then "❌ fail" else "… " + $c end;
+              def result_text($c): if $c == "success" then "✅ pass" elif $c == "failure" then "❌ fail" else "… " + $c end;
               (rows($pu) | map({(.[0]): (.[1] | tonumber)}) | add // {}) as $P
               | reduce rows($q)[] as $r ($st[0];
                   if   ($r[1] == "gone" or $r[1] == "err") then .repos |= del(.[$r[0]])
@@ -240,9 +240,11 @@ jobs:
                   elif $r[5] == "" then .repos |= del(.[$r[0]])
                   elif (($P[$r[0]] // 0) > ($r[4] | fromdateiso8601)) then .repos |= del(.[$r[0]])
                   else .repos[$r[0]] = {run_id: ($r[2] | tonumber), run_attempt: ($r[3] | tonumber),
-                                        created_at: $r[4], result: label($r[5]), score: $r[6]}
+                                        created_at: $r[4], result: result_text($r[5]), score: $r[6]}
                   end)
-              | reduce rows($cs)[] as $c (.; .checked_at[$c[0]] = $now)' > /tmp/store.new && mv /tmp/store.new "$STORE"
+              | reduce rows($cs)[] as $c (.; .checked_at[$c[0]] = $now)' > /tmp/store.new \
+              && jq -e '.repos and .checked_at' /tmp/store.new >/dev/null && mv /tmp/store.new "$STORE" \
+              || { echo "::error::could not update ${STORE} — no report written"; exit 1; }
 
             # what each in-scope repo shows: this run's answer first, else the stored result
             jq -rn --rawfile q /tmp/q.tsv --rawfile pu /tmp/pushed.tsv --rawfile sc /tmp/scope.tsv \
