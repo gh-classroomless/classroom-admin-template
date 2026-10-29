@@ -14,8 +14,11 @@ Run from anywhere; it works on the clone it sits in.
    the next report re-reads only repos with a new run.
 4. Writes `local/reports/<course>-repo-report.md`, or `<course>-<CODE>-repo-report.md` with
    `--assignment` (`local/` is in `.gitignore`): one table per assignment, `Username | Name |
-   Result | Score | Repo`, last-name order — the Action's detail layout. A rerun overwrites the
-   same file. A row still pending is marked `(pending)`.
+   Result | Score | Repo`, last-name order — the Action's detail layout. A row still pending is
+   marked `(pending)`.
+5. Writes the same rows as `<same name>.html` beside it — one self-contained page for a browser: a
+   search box (keeps only the rows containing the typed text), green / red results, each repo name
+   a link to the repo on GitHub. A rerun overwrites both files.
 
 Writes nothing to GitHub.
 """
@@ -136,9 +139,72 @@ def main():
     out = Path(a.out) if a.out else hc.local_dir(clone) / "reports" / f"{stem}-repo-report.md"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text("\n".join(lines) + "\n")
+    out_html = out.with_suffix(".html")
+    out_html.write_text(render_html(lines[0][2:], f"Generated {stamp} from {org}/classroom-admin log/ + "
+                                    f"open log: issues · {len(recs)} repos · {time.time() - t0:.1f}s",
+                                    by_asmt, res, org))
     n_pass = sum(v["result"] == "✅ pass" for v in res.values())
     print(f"{course}: {len(recs)} repos · {n_pass} pass · {len(by_asmt)} assignment(s) · "
-          f"{time.time() - t0:.1f}s\n→ {out}")
+          f"{time.time() - t0:.1f}s\n→ {out}\n→ {out_html}")
+
+
+_STYLE = """
+body{font-family:-apple-system,Segoe UI,Helvetica,Arial,sans-serif;margin:24px;color:#1f2328}
+h1{font-size:22px;margin:0 0 4px} h2{font-size:17px;margin:28px 0 6px}
+.meta{color:#59636e;font-size:13px;margin-bottom:14px}
+#q{width:340px;padding:7px 10px;font-size:14px;border:1px solid #d0d7de;border-radius:6px}
+table{border-collapse:collapse;font-size:13px;margin-top:6px}
+th,td{border:1px solid #d0d7de;padding:4px 10px;text-align:left}
+th{background:#f6f8fa} .pass{color:#1a7f37;font-weight:600} .fail{color:#cf222e;font-weight:600}
+.other{color:#59636e} .pending{color:#9a6700;font-size:12px}
+a{color:#0969da;text-decoration:none} a:hover{text-decoration:underline}
+"""
+
+_SEARCH = """
+document.getElementById('q').addEventListener('input', function () {
+  var q = this.value.trim().toLowerCase();
+  document.querySelectorAll('section').forEach(function (sec) {
+    var shown = 0;
+    sec.querySelectorAll('tbody tr').forEach(function (tr) {
+      var hit = !q || tr.textContent.toLowerCase().indexOf(q) >= 0;
+      tr.style.display = hit ? '' : 'none';
+      if (hit) shown++;
+    });
+    sec.style.display = shown ? '' : 'none';
+  });
+});
+"""
+
+
+def render_html(title, meta, by_asmt, res, org):
+    """The same rows as the .md, as one self-contained page: a search box that keeps only the rows
+    containing the typed text (any column), green/red results, repo names linked to GitHub."""
+    from html import escape as e
+
+    def cls(result):
+        return "pass" if result == "✅ pass" else "fail" if result == "❌ fail" else "other"
+    out = [f"<!doctype html><html><head><meta charset='utf-8'><title>{e(title)}</title>"
+           f"<style>{_STYLE}</style></head><body>", f"<h1>{e(title)}</h1>", f"<div class='meta'>{e(meta)}</div>",
+           "<input id='q' placeholder='Search name, username, repo, pass / fail …' autofocus>",
+           "<table><thead><tr><th>Assignment</th><th>Repos</th><th>Pass</th></tr></thead><tbody>"]
+    for asmt in sorted(by_asmt):
+        rows = by_asmt[asmt]
+        n = sum(res[r["repo"]]["result"] == "✅ pass" for r, _ in rows)
+        out.append(f"<tr><td><a href='#{e(asmt)}'>{e(asmt)}</a></td><td>{len(rows)}</td><td>{n}</td></tr>")
+    out.append("</tbody></table>")
+    for asmt in sorted(by_asmt):
+        out.append(f"<section id='{e(asmt)}'><h2>{e(asmt)}</h2><table><thead><tr><th>Username</th>"
+                   "<th>Name</th><th>Result</th><th>Score</th><th>Repo</th></tr></thead><tbody>")
+        for r, src in sorted(by_asmt[asmt], key=lambda rs: last_name_key(rs[0].get("name"))):
+            v = res[r["repo"]]
+            tag = " <span class='pending'>(pending)</span>" if src == "pending" else ""
+            out.append(f"<tr><td>{e(r['username'])}</td><td>{e(r.get('name', ''))}</td>"
+                       f"<td class='{cls(v['result'])}'>{e(v['result'])}</td><td>{e(v['score'])}</td>"
+                       f"<td><a href='https://github.com/{e(org)}/{e(r['repo'])}' target='_blank' "
+                       f"rel='noopener'>{e(r['repo'])}</a>{tag}</td></tr>")
+        out.append("</tbody></table></section>")
+    out.append(f"<script>{_SEARCH}</script></body></html>")
+    return "\n".join(out) + "\n"
 
 
 if __name__ == "__main__":
